@@ -28,7 +28,11 @@ from modlib.apps.tracker.byte_tracker import BYTETracker
 
 try:
     import torchreid
-    from torchreid.utils import FeatureExtractor
+    try:
+        from torchreid.utils import FeatureExtractor
+    except ImportError:
+        # Fallback for nested package structure in some PyPI versions of torchreid
+        from torchreid.reid.utils import FeatureExtractor
 except ImportError as e:
     import traceback
     traceback.print_exc()
