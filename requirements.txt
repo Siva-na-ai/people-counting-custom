@@ -11,4 +11,4 @@ pillow
 yacs
 tqdm
 matplotlib
-git+https://github.com/KaiyangZhou/deep-person-reid.git
+torchreid
