@@ -26,13 +26,14 @@ from modlib.devices import AiCamera
 from modlib.models.zoo import NanoDetPlus416x416
 from modlib.apps.tracker.byte_tracker import BYTETracker
 
-# Import torchreid for Person Re-Identification (OSNet)
 try:
     import torchreid
     from torchreid.utils import FeatureExtractor
-except ImportError:
+except ImportError as e:
+    import traceback
+    traceback.print_exc()
     raise ImportError(
-        "Please install torch and torchreid to run this script. "
+        f"Please install torch and torchreid to run this script. (Original error: {e}). "
         "Run: pip install torch torchvision torchreid"
     )
 
