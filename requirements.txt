@@ -2,4 +2,13 @@ numpy
 opencv-python
 torch
 torchvision
-torchreid
+scipy
+gdown
+scikit-learn
+h5py
+six
+pillow
+yacs
+tqdm
+matplotlib
+git+https://github.com/KaiyangZhou/deep-person-reid.git
