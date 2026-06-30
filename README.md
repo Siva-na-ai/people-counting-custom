@@ -10,23 +10,26 @@ This project contains Python scripts for real-time person tracking and counting 
 
 ---
 
-## 🛠️ Installation
+## 🛠️ Installation & Setup
 
-On your Raspberry Pi 5, run the following commands to install the required packages:
+You can automate the environment setup on your Raspberry Pi 5 using the provided shell script:
 
-1. **Install requirements:**
+1. **Run the setup script:**
    ```bash
-   pip install -r requirements.txt
+   chmod +x set.sh
+   ./set.sh
+   ```
+   *This script checks system requirements, creates a Python virtual environment (`venv`), installs `torch` and `torchvision`, upgrades `pip`, and installs all dependencies including `torchreid` and the Sony AITRIOS `modlib` SDK.*
+
+2. **Activate the virtual environment:**
+   ```bash
+   source venv/bin/activate
    ```
 
-   *Note: If you have issues installing `torchreid` directly from PyPI, you can install it from source:*
+3. **Install OpenCV system dependencies (if needed):**
+   If you run into OpenCV shared library errors when starting the demos, run:
    ```bash
-   pip install git+https://github.com/KaiyangZhou/deep-person-reid.git
-   ```
-
-2. **Ensure modlib is installed:**
-   ```bash
-   pip install git+https://github.com/SonySemiconductorSolutions/aitrios-rpi-application-module-library.git
+   sudo apt update && sudo apt install -y libglib2.0-0 libgl1-mesa-glx
    ```
 
 ---
