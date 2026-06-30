@@ -11,4 +11,9 @@ pillow
 yacs
 tqdm
 matplotlib
+tensorboard
+future
+imageio
+chardet
 torchreid
+git+https://github.com/SonySemiconductorSolutions/aitrios-rpi-application-module-library.git
