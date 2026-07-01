@@ -143,11 +143,11 @@ class BoTSORTTracker:
         """
         detections: Detections object or NumPy structured array.
         Returns:
-            NumPy structured array of tracked detections.
+            Detections object or NumPy structured array with updated track IDs.
         """
         num_dets = len(detections)
         
-        # Desired structured output dtype matching SDK expectations
+        # Desired structured output dtype (only used if fallback to numpy array is active)
         descr = [('box', '<f4', (4,)), ('confidence', '<f4'), ('class_id', '<i4'), ('track_id', '<i4')]
         new_dtype = np.dtype(descr)
         
@@ -155,18 +155,22 @@ class BoTSORTTracker:
             for track in self.tracks:
                 track.time_since_update += 1
             self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
-            return np.zeros(0, dtype=new_dtype)
+            if isinstance(detections, np.ndarray):
+                return np.zeros(0, dtype=new_dtype)
+            return detections
             
         boxes = []
         scores = []
         class_ids = []
         
-        # Check if detections is a Detections object (with attributes coords, confidence, class_id)
-        if hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
+        # Extract fields
+        is_numpy = isinstance(detections, np.ndarray)
+        
+        if not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
             boxes = detections.coords
             scores = detections.confidence
             class_ids = detections.class_id
-        elif isinstance(detections, np.ndarray) and detections.dtype.names is not None:
+        elif is_numpy and detections.dtype.names is not None:
             names = detections.dtype.names
             box_field = 'box' if 'box' in names else (names[0] if len(names) > 0 else None)
             score_field = 'confidence' if 'confidence' in names else ('score' if 'score' in names else (names[1] if len(names) > 1 else None))
@@ -306,18 +310,33 @@ class BoTSORTTracker:
             
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         
-        # Stage 6: Build tracked structured array output
-        if len(final_matched_tracks) == 0:
-            return np.zeros(0, dtype=new_dtype)
-            
-        tracked_arr = np.zeros(len(final_matched_tracks), dtype=new_dtype)
-        for i, track in enumerate(final_matched_tracks):
-            tracked_arr['box'][i] = track.box
-            tracked_arr['confidence'][i] = track.score
-            tracked_arr['class_id'][i] = track.class_id
-            tracked_arr['track_id'][i] = track.track_id
-            
-        return tracked_arr
+        # Sort matched tracks parallel to input detection order
+        sorted_pairs = sorted(zip(final_matched_det_indices, final_matched_tracks), key=lambda x: x[0])
+        tracker_ids_list = [track.track_id for _, track in sorted_pairs]
+        tracker_ids = np.array(tracker_ids_list, dtype=np.int32)
+        
+        # Stage 6: Update tracker IDs and return
+        if not is_numpy:
+            # Set the tracker IDs on the detections object in-place
+            if hasattr(detections, '_tracker_id'):
+                detections._tracker_id = tracker_ids
+            if hasattr(detections, 'tracker_id'):
+                try:
+                    detections.tracker_id = tracker_ids
+                except AttributeError:
+                    pass
+            return detections
+        else:
+            # Build and return NumPy structured array
+            if len(sorted_pairs) == 0:
+                return np.zeros(0, dtype=new_dtype)
+            tracked_arr = np.zeros(len(sorted_pairs), dtype=new_dtype)
+            for i, (d_idx, track) in enumerate(sorted_pairs):
+                tracked_arr['box'][i] = track.box
+                tracked_arr['confidence'][i] = track.score
+                tracked_arr['class_id'][i] = track.class_id
+                tracked_arr['track_id'][i] = track.track_id
+            return tracked_arr
 
 
 def json_regions_extraction(json_filename):
