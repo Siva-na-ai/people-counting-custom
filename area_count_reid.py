@@ -26,6 +26,21 @@ from modlib.devices import AiCamera
 from modlib.models.zoo import NanoDetPlus416x416
 from scipy.optimize import linear_sum_assignment
 
+try:
+    import torchreid
+    try:
+        from torchreid.utils import FeatureExtractor
+    except ImportError:
+        # Fallback for nested package structure in some PyPI versions of torchreid
+        from torchreid.reid.utils import FeatureExtractor
+except ImportError as e:
+    import traceback
+    traceback.print_exc()
+    raise ImportError(
+        f"Please install torch and torchreid to run this script. (Original error: {e}). "
+        "Run: pip install torch torchvision torchreid"
+    )
+
 # Helper function to compute IoU
 def compute_iou(box1, box2):
     # box format: [xmin, ymin, xmax, ymax]
