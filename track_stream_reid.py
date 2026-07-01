@@ -64,7 +64,7 @@ class Track:
         self.time_since_update = 0
 
 class BoTSORTTracker:
-    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30):
+    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=900):
         self.max_age = max_age
         self.reid_threshold = reid_threshold
         
@@ -183,16 +183,19 @@ class BoTSORTTracker:
                 scores.append(det_tuple[1])
                 class_ids.append(det_tuple[2])
                 
-        active_tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        active_tracks = self.tracks
         num_tracks = len(active_tracks)
         
         matched_track_indices = []
         matched_det_indices = []
         
-        # Stage 1: IoU / Motion Matching
-        if num_tracks > 0 and num_dets > 0:
-            iou_matrix = np.zeros((num_tracks, num_dets))
-            for t_idx, track in enumerate(active_tracks):
+        # Stage 1: IoU / Motion Matching (only for tracks that were active in the previous frame)
+        iou_tracks = [t for t in active_tracks if t.time_since_update == 0]
+        num_iou_tracks = len(iou_tracks)
+        
+        if num_iou_tracks > 0 and num_dets > 0:
+            iou_matrix = np.zeros((num_iou_tracks, num_dets))
+            for t_idx, track in enumerate(iou_tracks):
                 for d_idx in range(num_dets):
                     det_box = boxes[d_idx]
                     if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
@@ -207,11 +210,15 @@ class BoTSORTTracker:
                     matched_track_indices.append(r)
                     matched_det_indices.append(c)
                     
-        # Stage 2: ReID / Appearance Matching for unmatched tracks/detections
-        unmatched_track_indices = [t for t in range(num_tracks) if t not in matched_track_indices]
+        # Map stage 1 matches back to the original active_tracks
+        matched_tracks = [iou_tracks[r] for r in matched_track_indices]
+        matched_det_indices = list(matched_det_indices)
+        
+        # Stage 2: ReID / Appearance Matching for remaining unmatched tracks/detections
+        unmatched_tracks = [t for t in active_tracks if t not in matched_tracks]
         unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
         
-        if len(unmatched_track_indices) > 0 and len(unmatched_det_indices) > 0:
+        if len(unmatched_tracks) > 0 and len(unmatched_det_indices) > 0:
             det_embeddings = []
             valid_det_indices = []
             
@@ -225,11 +232,10 @@ class BoTSORTTracker:
                     det_embeddings.append(emb)
                     valid_det_indices.append(d_idx)
                     
-            if len(det_embeddings) > 0 and any(len(active_tracks[t_idx].embeddings) > 0 for t_idx in unmatched_track_indices):
-                reid_cost_matrix = np.ones((len(unmatched_track_indices), len(det_embeddings)))
+            if len(det_embeddings) > 0 and any(len(t.embeddings) > 0 for t in unmatched_tracks):
+                reid_cost_matrix = np.ones((len(unmatched_tracks), len(det_embeddings)))
                 
-                for i, t_idx in enumerate(unmatched_track_indices):
-                    track = active_tracks[t_idx]
+                for i, track in enumerate(unmatched_tracks):
                     if len(track.embeddings) == 0:
                         continue
                     for j, det_emb in enumerate(det_embeddings):
@@ -242,22 +248,21 @@ class BoTSORTTracker:
                 for r, c in zip(r_ind, c_ind):
                     max_sim = 1.0 - reid_cost_matrix[r, c]
                     if max_sim >= self.reid_threshold:
-                        t_idx = unmatched_track_indices[r]
+                        track = unmatched_tracks[r]
                         d_idx = valid_det_indices[c]
                         
-                        matched_track_indices.append(t_idx)
+                        matched_tracks.append(track)
                         matched_det_indices.append(d_idx)
-                        active_tracks[t_idx].embeddings.append(det_embeddings[c])
-                        if len(active_tracks[t_idx].embeddings) > 5:
-                            active_tracks[t_idx].embeddings.pop(0)
+                        track.embeddings.append(det_embeddings[c])
+                        if len(track.embeddings) > 5:
+                            track.embeddings.pop(0)
                             
         # Stage 3: Update matched track states
         final_matched_tracks = []
         final_matched_det_indices = []
-        matched_pairs = sorted(zip(matched_track_indices, matched_det_indices), key=lambda x: x[1])
+        matched_pairs = sorted(zip(matched_tracks, matched_det_indices), key=lambda x: x[1])
         
-        for t_idx, d_idx in matched_pairs:
-            track = active_tracks[t_idx]
+        for track, d_idx in matched_pairs:
             det_box = boxes[d_idx]
             if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
                 det_box = det_box.flatten()
@@ -300,9 +305,9 @@ class BoTSORTTracker:
             final_matched_det_indices.append(d_idx)
             
         # Stage 5: Age unmatched tracks
-        all_unmatched_track_indices = [t_idx for t_idx in range(num_tracks) if t_idx not in matched_track_indices]
-        for t_idx in all_unmatched_track_indices:
-            active_tracks[t_idx].time_since_update += 1
+        for track in self.tracks:
+            if track not in final_matched_tracks:
+                track.time_since_update += 1
             
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         
@@ -342,7 +347,7 @@ def main():
     device.deploy(model)
 
     # Initialize BoTSORT Tracker (combining tracking and ReID)
-    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30)
+    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=900)
     
     unique_seen_people = set()
     annotator = Annotator(thickness=1, text_thickness=1, text_scale=0.4)
