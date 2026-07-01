@@ -17,6 +17,8 @@
 import cv2
 import torch
 import numpy as np
+import subprocess
+import argparse
 from modlib.apps import Annotator
 from modlib.devices import AiCamera
 from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
@@ -53,6 +55,64 @@ def compute_iou(box1, box2):
     if union_area <= 0:
         return 0.0
     return inter_area / union_area
+
+class RTSPStreamer:
+    def __init__(self, rtsp_url, width, height, fps=30):
+        self.rtsp_url = rtsp_url
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.process = None
+        self.start()
+
+    def start(self):
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-f', 'rtsp',
+            '-rtsp_transport', 'tcp',
+            self.rtsp_url
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print(f"[*] Started streaming to MediaMTX at {self.rtsp_url}")
+        except FileNotFoundError:
+            print("[-] Error: 'ffmpeg' command not found. Please install ffmpeg on the system.")
+
+    def push_frame(self, frame):
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.stdin.write(frame.tobytes())
+                self.process.stdin.flush()
+            except Exception as e:
+                print(f"[-] Error writing frame to stream: {e}")
+                self.close()
+
+    def close(self):
+        if self.process:
+            try:
+                self.process.stdin.close()
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+            self.process = None
+            print("[*] Streaming connection closed.")
+
 
 class Track:
     def __init__(self, track_id, box, embedding, score, class_id):
@@ -340,7 +400,20 @@ class BoTSORTTracker:
             return tracked_arr
 
 
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--rtsp-url",
+        type=str,
+        default=None,
+        help="RTSP URL of the MediaMTX stream endpoint (e.g. rtsp://localhost:8554/mystream)"
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = get_args()
+    
     #-----Camera and AI setup-----
     device = AiCamera()
     model = SSDMobileNetV2FPNLite320x320()
@@ -352,36 +425,51 @@ def main():
     unique_seen_people = set()
     annotator = Annotator(thickness=1, text_thickness=1, text_scale=0.4)
 
-    with device as stream:
-        for frame in stream:
-            #-----Detection Filtering-----
-            detections = frame.detections[frame.detections.confidence > 0.55]
-            detections = detections[detections.class_id == 0]  # Person
-            
-            #-----Tracker Update-----
-            detections = tracker.update(frame.image, detections)
-
-            #-----ReID / Unique Visitor Count-----
-            for idx, (_, s, c, t) in enumerate(detections):
-                unique_seen_people.add(t)
-
-            #-----Display Annotations-----
-            annotator.set_label(
-                image=frame.image,
-                x=430,
-                y=30,
-                color=(200, 200, 200),
-                label="Total people detected: " + str(len(unique_seen_people)),
-            )
-
-            # Map the track ID in visual annotations
-            labels = []
-            for idx, (_, s, c, t) in enumerate(detections):
-                labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
+    streamer = None
+    try:
+        with device as stream:
+            for frame in stream:
+                #-----Detection Filtering-----
+                detections = frame.detections[frame.detections.confidence > 0.55]
+                detections = detections[detections.class_id == 0]  # Person
                 
-            annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
+                #-----Tracker Update-----
+                detections = tracker.update(frame.image, detections)
 
-            frame.display()
+                #-----ReID / Unique Visitor Count-----
+                for idx, (_, s, c, t) in enumerate(detections):
+                    unique_seen_people.add(t)
+
+                #-----Display Annotations-----
+                annotator.set_label(
+                    image=frame.image,
+                    x=430,
+                    y=30,
+                    color=(200, 200, 200),
+                    label="Total people detected: " + str(len(unique_seen_people)),
+                )
+
+                # Map the track ID in visual annotations
+                labels = []
+                for idx, (_, s, c, t) in enumerate(detections):
+                    labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
+                    
+                annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
+
+                #-----Stream to RTSP (MediaMTX)-----
+                if args.rtsp_url:
+                    if streamer is None:
+                        streamer = RTSPStreamer(args.rtsp_url, frame.width, frame.height)
+                    streamer.push_frame(frame.image)
+
+                try:
+                    frame.display()
+                except Exception:
+                    # Headless mode
+                    pass
+    finally:
+        if streamer:
+            streamer.close()
 
 
 if __name__ == "__main__":

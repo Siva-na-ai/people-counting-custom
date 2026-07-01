@@ -19,6 +19,7 @@ import argparse
 import cv2
 import torch
 import numpy as np
+import subprocess
 
 from modlib.apps.annotate import ColorPalette, Annotator, Color
 from modlib.apps.area import Area
@@ -57,6 +58,64 @@ def compute_iou(box1, box2):
     if union_area <= 0:
         return 0.0
     return inter_area / union_area
+
+class RTSPStreamer:
+    def __init__(self, rtsp_url, width, height, fps=30):
+        self.rtsp_url = rtsp_url
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.process = None
+        self.start()
+
+    def start(self):
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-f', 'rtsp',
+            '-rtsp_transport', 'tcp',
+            self.rtsp_url
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            print(f"[*] Started streaming to MediaMTX at {self.rtsp_url}")
+        except FileNotFoundError:
+            print("[-] Error: 'ffmpeg' command not found. Please install ffmpeg on the system.")
+
+    def push_frame(self, frame):
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.stdin.write(frame.tobytes())
+                self.process.stdin.flush()
+            except Exception as e:
+                print(f"[-] Error writing frame to stream: {e}")
+                self.close()
+
+    def close(self):
+        if self.process:
+            try:
+                self.process.stdin.close()
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+            self.process = None
+            print("[*] Streaming connection closed.")
+
 
 class Track:
     def __init__(self, track_id, box, embedding, score, class_id):
@@ -364,6 +423,12 @@ def get_args():
         default=None,
         help="Json file containing bboxes of areas",
     )
+    parser.add_argument(
+        "--rtsp-url",
+        type=str,
+        default=None,
+        help="RTSP URL of the MediaMTX stream endpoint (e.g. rtsp://localhost:8554/mystream)"
+    )
     return parser.parse_args()
     
 def start_area_count_demo():
@@ -386,68 +451,84 @@ def start_area_count_demo():
     annotator = Annotator(
         color=ColorPalette.default(), thickness=1, text_thickness=1, text_scale=0.4
     )
-    with device as stream:
-        for frame in stream:
-            #-----Camera and AI setup-----
-            detections = frame.detections[frame.detections.confidence > 0.5]
-            detections = detections[detections.class_id == 0]
-            
-            #-----Tracker Update-----
-            detections = tracker.update(frame.image, detections)
-            
-            #-----Display Annotations-----
-            labels = []
-            for idx, (_, s, c, t) in enumerate(detections):
-                labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
+    streamer = None
+    try:
+        with device as stream:
+            for frame in stream:
+                #-----Camera and AI setup-----
+                detections = frame.detections[frame.detections.confidence > 0.5]
+                detections = detections[detections.class_id == 0]
+                
+                #-----Tracker Update-----
+                detections = tracker.update(frame.image, detections)
+                
+                #-----Display Annotations-----
+                labels = []
+                for idx, (_, s, c, t) in enumerate(detections):
+                    labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
 
-            frame.image = annotator.annotate_boxes(
-                frame=frame,
-                detections=detections,
-                labels=labels,
-                color=Color(0, 255, 255),
-                alpha=0.2,
-            )
-            
-            if len(areas) == 0:
-                #-----Count and show all people-----
-                total_people = len(detections)
-                label = f"Total People Count: {total_people}"
-                annotator.set_label(
-                    image=frame.image,
-                    x=20,
-                    y=40,
-                    color=(0, 255, 255),
-                    label=label,
+                frame.image = annotator.annotate_boxes(
+                    frame=frame,
+                    detections=detections,
+                    labels=labels,
+                    color=Color(0, 255, 255),
+                    alpha=0.2,
                 )
-            else:
-                for ID, area in enumerate(areas):
-                    #-----Area-----
-                    d = detections[area.contains(detections)]
-                    #-----Visualize Detections-----
-                    frame.image = annotator.annotate_area(
-                        frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
+                
+                if len(areas) == 0:
+                    #-----Count and show all people-----
+                    total_people = len(detections)
+                    label = f"Total People Count: {total_people}"
+                    annotator.set_label(
+                        image=frame.image,
+                        x=20,
+                        y=40,
+                        color=(0, 255, 255),
+                        label=label,
                     )
-                    text_labels = [
-                        "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
-                        "Area ID: " + str(ID + 1),
-                    ]
-
-                    for index, label in enumerate(text_labels):
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        text_width, text_height = cv2.getTextSize(
-                            text=label,
-                            fontFace=font,
-                            fontScale=0.5,
-                            thickness=1,
-                        )[0]
-                        annotator.set_label(
-                            image=frame.image,
-                            x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
-                            y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
-                            color=(0, 255, 255),
-                            label=label,
+                else:
+                    for ID, area in enumerate(areas):
+                        #-----Area-----
+                        d = detections[area.contains(detections)]
+                        #-----Visualize Detections-----
+                        frame.image = annotator.annotate_area(
+                            frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
                         )
-            frame.display()
+                        text_labels = [
+                            "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
+                            "Area ID: " + str(ID + 1),
+                        ]
+
+                        for index, label in enumerate(text_labels):
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            text_width, text_height = cv2.getTextSize(
+                                text=label,
+                                fontFace=font,
+                                fontScale=0.5,
+                                thickness=1,
+                            )[0]
+                            annotator.set_label(
+                                image=frame.image,
+                                x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
+                                y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
+                                color=(0, 255, 255),
+                                label=label,
+                            )
+                
+                #-----Stream to RTSP (MediaMTX)-----
+                if args.rtsp_url:
+                    if streamer is None:
+                        streamer = RTSPStreamer(args.rtsp_url, frame.width, frame.height)
+                    streamer.push_frame(frame.image)
+
+                try:
+                    frame.display()
+                except Exception:
+                    # Headless mode
+                    pass
+    finally:
+        if streamer:
+            streamer.close()
 
 
 if __name__ == "__main__":
