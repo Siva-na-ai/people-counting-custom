@@ -17,57 +17,51 @@
 import cv2
 import torch
 import numpy as np
-from modlib.apps import Annotator, BYTETracker
-from modlib.devices import AiCamera
-from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
+from modlib.apps import Annotator
+from scipy.optimize import linear_sum_assignment
 
-try:
-    import torchreid
-    try:
-        from torchreid.utils import FeatureExtractor
-    except ImportError:
-        # Fallback for nested package structure in some PyPI versions of torchreid
-        from torchreid.reid.utils import FeatureExtractor
-except ImportError as e:
-    import traceback
-    traceback.print_exc()
-    raise ImportError(
-        f"Please install torch and torchreid to run this script. (Original error: {e}). "
-        "Run: pip install torch torchvision torchreid"
-    )
+# Helper function to compute IoU
+def compute_iou(box1, box2):
+    # box format: [xmin, ymin, xmax, ymax]
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = box1_area + box2_area - inter_area
+    
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
 
+class Track:
+    def __init__(self, track_id, box, embedding, score, class_id):
+        self.track_id = track_id
+        self.box = box
+        self.score = score
+        self.class_id = class_id
+        self.embeddings = [embedding] if embedding is not None else []
+        self.time_since_update = 0
 
-class BYTETrackerArgs:
-    track_thresh: float = 0.25
-    track_buffer: int = 30
-    match_thresh: float = 0.8
-    aspect_ratio_thresh: float = 3.0
-    min_box_area: float = 1.0
-    mot20: bool = False
-
-
-class PersonReID:
-    def __init__(self, model_name='osnet_x1_0', threshold=0.70, device='cpu'):
-        self.device = device
-        self.threshold = threshold
-        # Initialize torchreid FeatureExtractor
+class BoTSORTTracker:
+    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30):
+        self.max_age = max_age
+        self.reid_threshold = reid_threshold
+        
+        # Initialize ReID FeatureExtractor
         self.extractor = FeatureExtractor(
-            model_name=model_name,
-            device=self.device
+            model_name=reid_model_name,
+            device=device
         )
-        # Gallery to store known identities:
-        # global_id -> list of feature embeddings (numpy arrays of shape (512,))
-        self.gallery = {}
-        # Mapping from BYTETracker's track_id to our persistent global_id
-        self.track_to_global = {}
-        self.next_global_id = 1
-        # Cache for the last crop of each track ID
-        self.last_crop = {}
+        self.tracks = []
+        self.next_track_id = 1
         
     def get_crop(self, image, box):
         """
         Extract and preprocess the crop from the image.
-        box coordinates can be normalized [xmin, ymin, xmax, ymax] or absolute pixels.
         """
         h, w, _ = image.shape
         if any(coord > 2.0 for coord in box):
@@ -104,103 +98,153 @@ class PersonReID:
                 embedding = embedding / norm
             return embedding
 
-    def update_tracks(self, frame_image, tracked_detections):
+    def update(self, frame_image, detections):
         """
-        tracked_detections: iterable of (box, score, class_id, track_id)
+        detections: NumPy structured array of detections.
         Returns:
-            list of global_ids matching the order of tracked_detections
+            NumPy structured array of tracked detections.
         """
-        current_global_ids = []
-        active_track_ids = set()
-        
-        # Populate active track IDs and cache crops for already tracked targets
-        for detection in tracked_detections:
-            box, score, class_id, track_id = detection
-            active_track_ids.add(track_id)
+        if len(detections) == 0:
+            for track in self.tracks:
+                track.time_since_update += 1
+            self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+            return detections.copy()
             
-            if track_id in self.track_to_global:
-                crop = self.get_crop(frame_image, box)
+        active_tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        num_tracks = len(active_tracks)
+        num_dets = len(detections)
+        
+        matched_track_indices = []
+        matched_det_indices = []
+        
+        # Stage 1: IoU / Motion Matching
+        if num_tracks > 0 and num_dets > 0:
+            iou_matrix = np.zeros((num_tracks, num_dets))
+            for t_idx, track in enumerate(active_tracks):
+                for d_idx in range(num_dets):
+                    det_box = detections[d_idx]['box'] if 'box' in detections.dtype.names else detections[d_idx][0]
+                    iou_matrix[t_idx, d_idx] = compute_iou(track.box, det_box)
+            
+            cost_matrix = 1.0 - iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                if iou_matrix[r, c] >= 0.50:
+                    matched_track_indices.append(r)
+                    matched_det_indices.append(c)
+                    
+        # Stage 2: ReID / Appearance Matching for unmatched tracks/detections
+        unmatched_track_indices = [t for t in range(num_tracks) if t not in matched_track_indices]
+        unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
+        
+        if len(unmatched_track_indices) > 0 and len(unmatched_det_indices) > 0:
+            det_embeddings = []
+            valid_det_indices = []
+            
+            for d_idx in unmatched_det_indices:
+                det_box = detections[d_idx]['box'] if 'box' in detections.dtype.names else detections[d_idx][0]
+                crop = self.get_crop(frame_image, det_box)
                 if crop is not None:
-                    self.last_crop[track_id] = crop
+                    emb = self.extract_embedding(crop)
+                    det_embeddings.append(emb)
+                    valid_det_indices.append(d_idx)
                     
-        # Identify global IDs already active in this frame (to avoid identity theft)
-        active_global_ids = {self.track_to_global[t_id] for t_id in active_track_ids if t_id in self.track_to_global}
+            if len(det_embeddings) > 0 and any(len(active_tracks[t_idx].embeddings) > 0 for t_idx in unmatched_track_indices):
+                reid_cost_matrix = np.ones((len(unmatched_track_indices), len(det_embeddings)))
+                
+                for i, t_idx in enumerate(unmatched_track_indices):
+                    track = active_tracks[t_idx]
+                    if len(track.embeddings) == 0:
+                        continue
+                    for j, det_emb in enumerate(det_embeddings):
+                        sims = [np.dot(det_emb, stored_emb) for stored_emb in track.embeddings]
+                        max_sim = max(sims) if sims else 0.0
+                        reid_cost_matrix[i, j] = 1.0 - max_sim
+                
+                r_ind, c_ind = linear_sum_assignment(reid_cost_matrix)
+                
+                for r, c in zip(r_ind, c_ind):
+                    max_sim = 1.0 - reid_cost_matrix[r, c]
+                    if max_sim >= self.reid_threshold:
+                        t_idx = unmatched_track_indices[r]
+                        d_idx = valid_det_indices[c]
+                        
+                        matched_track_indices.append(t_idx)
+                        matched_det_indices.append(d_idx)
+                        active_tracks[t_idx].embeddings.append(det_embeddings[c])
+                        if len(active_tracks[t_idx].embeddings) > 5:
+                            active_tracks[t_idx].embeddings.pop(0)
+                            
+        # Stage 3: Update matched track states
+        final_matched_tracks = []
+        final_matched_det_indices = []
+        matched_pairs = sorted(zip(matched_track_indices, matched_det_indices), key=lambda x: x[1])
         
-        for detection in tracked_detections:
-            box, score, class_id, track_id = detection
+        for t_idx, d_idx in matched_pairs:
+            track = active_tracks[t_idx]
+            det_box = detections[d_idx]['box'] if 'box' in detections.dtype.names else detections[d_idx][0]
+            det_score = detections[d_idx]['confidence'] if 'confidence' in detections.dtype.names else detections[d_idx][1]
+            det_class = detections[d_idx]['class_id'] if 'class_id' in detections.dtype.names else detections[d_idx][2]
             
-            # If we already mapped this track_id, reuse the global_id
-            if track_id in self.track_to_global:
-                current_global_ids.append(self.track_to_global[track_id])
-                continue
-                
-            # If it's a new track_id, we crop and extract features
-            crop = self.get_crop(frame_image, box)
-            if crop is None:
-                # If we cannot crop, assign a new global ID without embedding
-                global_id = self.next_global_id
-                self.next_global_id += 1
-                self.track_to_global[track_id] = global_id
-                current_global_ids.append(global_id)
-                active_global_ids.add(global_id)
-                continue
-                
-            # Cache the crop for future updates
-            self.last_crop[track_id] = crop
-            embedding = self.extract_embedding(crop)
+            track.box = det_box
+            track.score = det_score
+            track.class_id = det_class
+            track.time_since_update = 0
             
-            # Match against our gallery of known global_ids
-            best_match_id = None
-            best_similarity = -1.0
+            final_matched_tracks.append(track)
+            final_matched_det_indices.append(d_idx)
             
-            for g_id, embeddings in self.gallery.items():
-                # Avoid matching with a global ID that is already active in this frame
-                if g_id in active_global_ids:
-                    continue
-                    
-                # Compare similarity against stored embeddings for this global ID
-                sims = [np.dot(embedding, stored_emb) for stored_emb in embeddings]
-                max_sim = max(sims) if sims else 0.0
-                
-                if max_sim > best_similarity:
-                    best_similarity = max_sim
-                    best_match_id = g_id
+        # Stage 4: Create new tracks for unmatched detections
+        all_unmatched_det_indices = [d for d in range(num_dets) if d not in final_matched_det_indices]
+        for d_idx in all_unmatched_det_indices:
+            det_box = detections[d_idx]['box'] if 'box' in detections.dtype.names else detections[d_idx][0]
+            det_score = detections[d_idx]['confidence'] if 'confidence' in detections.dtype.names else detections[d_idx][1]
+            det_class = detections[d_idx]['class_id'] if 'class_id' in detections.dtype.names else detections[d_idx][2]
             
-            if best_similarity >= self.threshold and best_match_id is not None:
-                # Re-identified!
-                global_id = best_match_id
-                self.gallery[global_id].append(embedding)
-                if len(self.gallery[global_id]) > 5:
-                    self.gallery[global_id].pop(0)
+            crop = self.get_crop(frame_image, det_box)
+            emb = self.extract_embedding(crop) if crop is not None else None
+            
+            new_track = Track(self.next_track_id, det_box, emb, det_score, det_class)
+            self.next_track_id += 1
+            
+            self.tracks.append(new_track)
+            final_matched_tracks.append(new_track)
+            final_matched_det_indices.append(d_idx)
+            
+        # Stage 5: Age unmatched tracks
+        all_unmatched_track_indices = [t_idx for t_idx in range(num_tracks) if t_idx not in matched_track_indices]
+        for t_idx in all_unmatched_track_indices:
+            active_tracks[t_idx].time_since_update += 1
+            
+        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        
+        # Stage 6: Build tracked structured array output
+        if len(final_matched_tracks) == 0:
+            return detections.copy()[:0]
+            
+        if detections.dtype.names and len(detections.dtype.names) >= 4:
+            track_id_field = detections.dtype.names[3]
+            tracked_dets = np.copy(detections[final_matched_det_indices])
+            for i, track in enumerate(final_matched_tracks):
+                tracked_dets[track_id_field][i] = track.track_id
+        else:
+            descr = detections.dtype.descr
+            field_names = [d[0] for d in descr]
+            if 'track_id' in field_names:
+                track_id_field = 'track_id'
+                tracked_dets = np.copy(detections[final_matched_det_indices])
+                for i, track in enumerate(final_matched_tracks):
+                    tracked_dets[track_id_field][i] = track.track_id
             else:
-                # New person detected
-                global_id = self.next_global_id
-                self.next_global_id += 1
-                self.gallery[global_id] = [embedding]
-                
-            self.track_to_global[track_id] = global_id
-            current_global_ids.append(global_id)
-            active_global_ids.add(global_id)
-            
-        # Clean up track_to_global map and extract latest embeddings for tracks that are no longer active
-        inactive_tracks = set(self.track_to_global.keys()) - active_track_ids
-        for t_id in inactive_tracks:
-            global_id = self.track_to_global[t_id]
-            # When the track is lost, we extract its latest embedding and add it to the gallery
-            if t_id in self.last_crop:
-                crop = self.last_crop[t_id]
-                if crop is not None:
-                    try:
-                        embedding = self.extract_embedding(crop)
-                        self.gallery[global_id].append(embedding)
-                        if len(self.gallery[global_id]) > 5:
-                            self.gallery[global_id].pop(0)
-                    except Exception:
-                        pass
-                del self.last_crop[t_id]
-            del self.track_to_global[t_id]
-            
-        return current_global_ids
+                descr.append(('track_id', '<i4'))
+                new_dtype = np.dtype(descr)
+                tracked_dets = np.zeros(len(final_matched_det_indices), dtype=new_dtype)
+                for name in detections.dtype.names:
+                    tracked_dets[name] = detections[name][final_matched_det_indices]
+                for i, track in enumerate(final_matched_tracks):
+                    tracked_dets['track_id'][i] = track.track_id
+                    
+        return tracked_dets
 
 
 def main():
@@ -209,9 +253,8 @@ def main():
     model = SSDMobileNetV2FPNLite320x320()
     device.deploy(model)
 
-    tracker = BYTETracker(BYTETrackerArgs())
-    # Initialize ReID module using OSNet (default to cpu for RPi 5 suitability)
-    reid = PersonReID(model_name='osnet_x1_0', threshold=0.70, device='cpu')
+    # Initialize BoTSORT Tracker (combining tracking and ReID)
+    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30)
     
     unique_seen_people = set()
     annotator = Annotator(thickness=1, text_thickness=1, text_scale=0.4)
@@ -222,13 +265,12 @@ def main():
             detections = frame.detections[frame.detections.confidence > 0.55]
             detections = detections[detections.class_id == 0]  # Person
             
-            #-----Tracker-----
-            detections = tracker.update(frame, detections)
+            #-----Tracker Update-----
+            detections = tracker.update(frame.image, detections)
 
-            #-----ReID Update-----
-            global_ids = reid.update_tracks(frame.image, detections)
-            for g_id in global_ids:
-                unique_seen_people.add(g_id)
+            #-----ReID / Unique Visitor Count-----
+            for idx, (_, s, c, t) in enumerate(detections):
+                unique_seen_people.add(t)
 
             #-----Display Annotations-----
             annotator.set_label(
@@ -239,11 +281,10 @@ def main():
                 label="Total people detected: " + str(len(unique_seen_people)),
             )
 
-            # Map the raw track ID to the persistent global ReID ID in visual annotations
+            # Map the track ID in visual annotations
             labels = []
             for idx, (_, s, c, t) in enumerate(detections):
-                g_id = global_ids[idx]
-                labels.append(f"#{g_id} {model.labels[c]}: {s:0.2f}")
+                labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
                 
             annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
 
