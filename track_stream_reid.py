@@ -63,36 +63,6 @@ class Track:
         self.embeddings = [embedding] if embedding is not None else []
         self.time_since_update = 0
 
-def update_detection_track_id(detections, d_idx, track_id):
-    det = detections[d_idx]
-    # Try index assignment first (if mutable row/object)
-    try:
-        det[3] = track_id
-        return
-    except (TypeError, IndexError, KeyError):
-        pass
-    
-    # Try attribute setting (if custom class)
-    for attr in ['track_id', 'id', 'trackId', '_track_id', '_id']:
-        if hasattr(det, attr):
-            try:
-                setattr(det, attr, track_id)
-                return
-            except AttributeError:
-                pass
-            
-    # If row is immutable, replace the row in the container
-    try:
-        det_tuple = list(det)
-        if len(det_tuple) >= 4:
-            det_tuple[3] = track_id
-        else:
-            det_tuple.append(track_id)
-        # Try to assign back to container
-        detections[d_idx] = tuple(det_tuple)
-    except (TypeError, IndexError):
-        pass
-
 class BoTSORTTracker:
     def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30):
         self.max_age = max_age
@@ -157,7 +127,10 @@ class BoTSORTTracker:
                     item = detections[0]
                     print("DEBUG: item type:", type(item))
                     print("DEBUG: item dir:", dir(item))
-                    print("DEBUG: item tuple:", tuple(item))
+                    if hasattr(detections, 'coords'):
+                        print("DEBUG: coords:", detections.coords)
+                    else:
+                        print("DEBUG: item tuple:", tuple(item))
             except Exception as e2:
                 print("DEBUG: Failed to inspect detections:", str(e2))
             raise e
@@ -166,17 +139,48 @@ class BoTSORTTracker:
         """
         detections: Detections object or NumPy structured array.
         Returns:
-            Detections object or NumPy structured array with updated track IDs.
+            NumPy structured array of tracked detections.
         """
-        if len(detections) == 0:
+        num_dets = len(detections)
+        
+        # Desired structured output dtype matching SDK expectations
+        descr = [('box', '<f4', (4,)), ('confidence', '<f4'), ('class_id', '<i4'), ('track_id', '<i4')]
+        new_dtype = np.dtype(descr)
+        
+        if num_dets == 0:
             for track in self.tracks:
                 track.time_since_update += 1
             self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
-            return detections
+            return np.zeros(0, dtype=new_dtype)
             
+        boxes = []
+        scores = []
+        class_ids = []
+        
+        # Check if detections is a Detections object (with attributes coords, confidence, class_id)
+        if hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
+            boxes = detections.coords
+            scores = detections.confidence
+            class_ids = detections.class_id
+        elif isinstance(detections, np.ndarray) and detections.dtype.names is not None:
+            names = detections.dtype.names
+            box_field = 'box' if 'box' in names else (names[0] if len(names) > 0 else None)
+            score_field = 'confidence' if 'confidence' in names else ('score' if 'score' in names else (names[1] if len(names) > 1 else None))
+            class_field = 'class_id' if 'class_id' in names else (names[2] if len(names) > 2 else None)
+            
+            for d_idx in range(num_dets):
+                boxes.append(detections[d_idx][box_field] if box_field else detections[d_idx][0])
+                scores.append(detections[d_idx][score_field] if score_field else detections[d_idx][1])
+                class_ids.append(detections[d_idx][class_field] if class_field else detections[d_idx][2])
+        else:
+            for det in detections:
+                det_tuple = tuple(det)
+                boxes.append(det_tuple[0])
+                scores.append(det_tuple[1])
+                class_ids.append(det_tuple[2])
+                
         active_tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         num_tracks = len(active_tracks)
-        num_dets = len(detections)
         
         matched_track_indices = []
         matched_det_indices = []
@@ -186,7 +190,9 @@ class BoTSORTTracker:
             iou_matrix = np.zeros((num_tracks, num_dets))
             for t_idx, track in enumerate(active_tracks):
                 for d_idx in range(num_dets):
-                    det_box = tuple(detections[d_idx])[0]
+                    det_box = boxes[d_idx]
+                    if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                        det_box = det_box.flatten()
                     iou_matrix[t_idx, d_idx] = compute_iou(track.box, det_box)
             
             cost_matrix = 1.0 - iou_matrix
@@ -206,7 +212,9 @@ class BoTSORTTracker:
             valid_det_indices = []
             
             for d_idx in unmatched_det_indices:
-                det_box = tuple(detections[d_idx])[0]
+                det_box = boxes[d_idx]
+                if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                    det_box = det_box.flatten()
                 crop = self.get_crop(frame_image, det_box)
                 if crop is not None:
                     emb = self.extract_embedding(crop)
@@ -246,10 +254,15 @@ class BoTSORTTracker:
         
         for t_idx, d_idx in matched_pairs:
             track = active_tracks[t_idx]
-            det_tuple = tuple(detections[d_idx])
-            det_box = det_tuple[0]
-            det_score = det_tuple[1]
-            det_class = det_tuple[2]
+            det_box = boxes[d_idx]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            det_score = scores[d_idx]
+            if isinstance(det_score, np.ndarray):
+                det_score = float(det_score.item())
+            det_class = class_ids[d_idx]
+            if isinstance(det_class, np.ndarray):
+                det_class = int(det_class.item())
             
             track.box = det_box
             track.score = det_score
@@ -262,10 +275,15 @@ class BoTSORTTracker:
         # Stage 4: Create new tracks for unmatched detections
         all_unmatched_det_indices = [d for d in range(num_dets) if d not in final_matched_det_indices]
         for d_idx in all_unmatched_det_indices:
-            det_tuple = tuple(detections[d_idx])
-            det_box = det_tuple[0]
-            det_score = det_tuple[1]
-            det_class = det_tuple[2]
+            det_box = boxes[d_idx]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            det_score = scores[d_idx]
+            if isinstance(det_score, np.ndarray):
+                det_score = float(det_score.item())
+            det_class = class_ids[d_idx]
+            if isinstance(det_class, np.ndarray):
+                det_class = int(det_class.item())
             
             crop = self.get_crop(frame_image, det_box)
             emb = self.extract_embedding(crop) if crop is not None else None
@@ -284,11 +302,18 @@ class BoTSORTTracker:
             
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         
-        # Stage 6: Update track IDs in-place on the detections container
-        for d_idx, track in zip(final_matched_det_indices, final_matched_tracks):
-            update_detection_track_id(detections, d_idx, track.track_id)
+        # Stage 6: Build tracked structured array output
+        if len(final_matched_tracks) == 0:
+            return np.zeros(0, dtype=new_dtype)
             
-        return detections
+        tracked_arr = np.zeros(len(final_matched_tracks), dtype=new_dtype)
+        for i, track in enumerate(final_matched_tracks):
+            tracked_arr['box'][i] = track.box
+            tracked_arr['confidence'][i] = track.score
+            tracked_arr['class_id'][i] = track.class_id
+            tracked_arr['track_id'][i] = track.track_id
+            
+        return tracked_arr
 
 
 def main():
