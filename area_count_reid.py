@@ -68,7 +68,7 @@ class Track:
         self.time_since_update = 0
 
 class BoTSORTTracker:
-    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=900):
+    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900):
         self.max_age = max_age
         self.reid_threshold = reid_threshold
         
@@ -258,7 +258,7 @@ class BoTSORTTracker:
                         matched_tracks.append(track)
                         matched_det_indices.append(d_idx)
                         track.embeddings.append(det_embeddings[c])
-                        if len(track.embeddings) > 5:
+                        if len(track.embeddings) > 10:
                             track.embeddings.pop(0)
                             
         # Stage 3: Update matched track states
@@ -381,7 +381,7 @@ def start_area_count_demo():
             areas.append(Area(area["points"]))
 
     # Initialize BoTSORT Tracker (combining tracking and ReID)
-    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=900)
+    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900)
     
     annotator = Annotator(
         color=ColorPalette.default(), thickness=1, text_thickness=1, text_scale=0.4
