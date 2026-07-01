@@ -355,7 +355,8 @@ def get_args():
     parser.add_argument(
         "--json-file",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="Json file containing bboxes of areas",
     )
     return parser.parse_args()
@@ -368,10 +369,11 @@ def start_area_count_demo():
     device = AiCamera()
     device.deploy(model)
 
-    json_areas = json_regions_extraction(args.json_file)
     areas = []
-    for area in json_areas: 
-        areas.append(Area(area["points"]))
+    if args.json_file is not None:
+        json_areas = json_regions_extraction(args.json_file)
+        for area in json_areas: 
+            areas.append(Area(area["points"]))
 
     # Initialize BoTSORT Tracker (combining tracking and ReID)
     tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.65, device='cpu', max_age=30)
@@ -400,33 +402,46 @@ def start_area_count_demo():
                 color=Color(0, 255, 255),
                 alpha=0.2,
             )
-            for ID, area in enumerate(areas):
-                #-----Area-----
-                d = detections[area.contains(detections)]
-                #-----Visualize Detections-----
-                frame.image = annotator.annotate_area(
-                    frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
+            
+            if len(areas) == 0:
+                #-----Count and show all people-----
+                total_people = len(detections)
+                label = f"Total People Count: {total_people}"
+                annotator.set_label(
+                    image=frame.image,
+                    x=20,
+                    y=40,
+                    color=(0, 255, 255),
+                    label=label,
                 )
-                text_labels = [
-                    "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
-                    "Area ID: " + str(ID + 1),
-                ]
-
-                for index, label in enumerate(text_labels):
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    text_width, text_height = cv2.getTextSize(
-                        text=label,
-                        fontFace=font,
-                        fontScale=0.5,
-                        thickness=1,
-                    )[0]
-                    annotator.set_label(
-                        image=frame.image,
-                        x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
-                        y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
-                        color=(0, 255, 255),
-                        label=label,
+            else:
+                for ID, area in enumerate(areas):
+                    #-----Area-----
+                    d = detections[area.contains(detections)]
+                    #-----Visualize Detections-----
+                    frame.image = annotator.annotate_area(
+                        frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
                     )
+                    text_labels = [
+                        "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
+                        "Area ID: " + str(ID + 1),
+                    ]
+
+                    for index, label in enumerate(text_labels):
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        text_width, text_height = cv2.getTextSize(
+                            text=label,
+                            fontFace=font,
+                            fontScale=0.5,
+                            thickness=1,
+                        )[0]
+                        annotator.set_label(
+                            image=frame.image,
+                            x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
+                            y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
+                            color=(0, 255, 255),
+                            label=label,
+                        )
             frame.display()
 
 
