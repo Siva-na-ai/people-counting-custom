@@ -61,6 +61,8 @@ class PersonReID:
         # Mapping from BYTETracker's track_id to our persistent global_id
         self.track_to_global = {}
         self.next_global_id = 1
+        # Cache for the last crop of each track ID
+        self.last_crop = {}
         
     def get_crop(self, image, box):
         """
@@ -68,7 +70,7 @@ class PersonReID:
         box coordinates can be normalized [xmin, ymin, xmax, ymax] or absolute pixels.
         """
         h, w, _ = image.shape
-        if any(coord > 1.0 for coord in box):
+        if any(coord > 2.0 for coord in box):
             # Absolute coordinates
             xmin = int(max(0, box[0]))
             ymin = int(max(0, box[1]))
@@ -111,9 +113,21 @@ class PersonReID:
         current_global_ids = []
         active_track_ids = set()
         
+        # Populate active track IDs and cache crops for already tracked targets
         for detection in tracked_detections:
             box, score, class_id, track_id = detection
             active_track_ids.add(track_id)
+            
+            if track_id in self.track_to_global:
+                crop = self.get_crop(frame_image, box)
+                if crop is not None:
+                    self.last_crop[track_id] = crop
+                    
+        # Identify global IDs already active in this frame (to avoid identity theft)
+        active_global_ids = {self.track_to_global[t_id] for t_id in active_track_ids if t_id in self.track_to_global}
+        
+        for detection in tracked_detections:
+            box, score, class_id, track_id = detection
             
             # If we already mapped this track_id, reuse the global_id
             if track_id in self.track_to_global:
@@ -128,8 +142,11 @@ class PersonReID:
                 self.next_global_id += 1
                 self.track_to_global[track_id] = global_id
                 current_global_ids.append(global_id)
+                active_global_ids.add(global_id)
                 continue
                 
+            # Cache the crop for future updates
+            self.last_crop[track_id] = crop
             embedding = self.extract_embedding(crop)
             
             # Match against our gallery of known global_ids
@@ -138,7 +155,7 @@ class PersonReID:
             
             for g_id, embeddings in self.gallery.items():
                 # Avoid matching with a global ID that is already active in this frame
-                if g_id in current_global_ids:
+                if g_id in active_global_ids:
                     continue
                     
                 # Compare similarity against stored embeddings for this global ID
@@ -163,10 +180,24 @@ class PersonReID:
                 
             self.track_to_global[track_id] = global_id
             current_global_ids.append(global_id)
+            active_global_ids.add(global_id)
             
-        # Clean up track_to_global map for tracks that are no longer active
+        # Clean up track_to_global map and extract latest embeddings for tracks that are no longer active
         inactive_tracks = set(self.track_to_global.keys()) - active_track_ids
         for t_id in inactive_tracks:
+            global_id = self.track_to_global[t_id]
+            # When the track is lost, we extract its latest embedding and add it to the gallery
+            if t_id in self.last_crop:
+                crop = self.last_crop[t_id]
+                if crop is not None:
+                    try:
+                        embedding = self.extract_embedding(crop)
+                        self.gallery[global_id].append(embedding)
+                        if len(self.gallery[global_id]) > 5:
+                            self.gallery[global_id].pop(0)
+                    except Exception:
+                        pass
+                del self.last_crop[t_id]
             del self.track_to_global[t_id]
             
         return current_global_ids
