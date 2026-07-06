@@ -20,6 +20,8 @@ import cv2
 import torch
 import numpy as np
 import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from modlib.apps.annotate import ColorPalette, Annotator, Color
 from modlib.apps.area import Area
@@ -59,62 +61,132 @@ def compute_iou(box1, box2):
         return 0.0
     return inter_area / union_area
 
-class RTSPStreamer:
-    def __init__(self, rtsp_url, width, height, fps=30):
-        self.rtsp_url = rtsp_url
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.process = None
+class StreamingHandler(BaseHTTPRequestHandler):
+    streamer = None
+
+    def log_message(self, format, *args):
+        # Suppress logging of incoming HTTP requests to avoid console spamming
+        pass
+
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            html = """
+            <html>
+              <head>
+                <title>Raspberry Pi AI Camera Stream</title>
+                <style>
+                  body {
+                    margin: 0;
+                    background-color: #121212;
+                    color: #ffffff;
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                  }
+                  h1 {
+                    margin-bottom: 20px;
+                    font-weight: 300;
+                  }
+                  .stream-container {
+                    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+                    border-radius: 8px;
+                    overflow: hidden;
+                    border: 1px solid #333;
+                    max-width: 100%;
+                  }
+                  img {
+                    display: block;
+                    width: 100%;
+                    height: auto;
+                    max-height: 80vh;
+                  }
+                </style>
+              </head>
+              <body>
+                <h1>Live Camera Stream</h1>
+                <div class="stream-container">
+                  <img src="/stream" />
+                </div>
+              </body>
+            </html>
+            """
+            self.wfile.write(html.encode('utf-8'))
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Age', '0')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            try:
+                while True:
+                    with self.streamer.condition:
+                        self.streamer.condition.wait()
+                        frame_bytes = self.streamer.frame_bytes
+                    
+                    if frame_bytes is None:
+                        break
+                    
+                    self.wfile.write(b'--frame\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(frame_bytes)))
+                    self.end_headers()
+                    self.wfile.write(frame_bytes)
+                    self.wfile.write(b'\r\n')
+            except Exception:
+                # Connection reset or browser closed tab
+                pass
+        else:
+            self.send_error(404)
+
+class HTTPStreamer:
+    def __init__(self, port=8000):
+        self.port = port
+        self.frame_bytes = None
+        self.condition = threading.Condition()
+        self.server = None
+        self.server_thread = None
         self.start()
 
     def start(self):
-        command = [
-            'ffmpeg',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{self.width}x{self.height}',
-            '-r', str(self.fps),
-            '-i', '-',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-f', 'rtsp',
-            '-rtsp_transport', 'tcp',
-            self.rtsp_url
-        ]
+        class CustomHandler(StreamingHandler):
+            streamer = self
+
         try:
-            self.process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            print(f"[*] Started streaming to MediaMTX at {self.rtsp_url}")
-        except FileNotFoundError:
-            print("[-] Error: 'ffmpeg' command not found. Please install ffmpeg on the system.")
+            self.server = HTTPServer(('0.0.0.0', self.port), CustomHandler)
+            self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.server_thread.start()
+            print(f"[*] Started HTTP MJPEG server at http://localhost:{self.port}")
+        except Exception as e:
+            print(f"[-] Error starting HTTP server on port {self.port}: {e}")
 
     def push_frame(self, frame):
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.stdin.write(frame.tobytes())
-                self.process.stdin.flush()
-            except Exception as e:
-                print(f"[-] Error writing frame to stream: {e}")
-                self.close()
+        try:
+            _, jpeg = cv2.imencode('.jpg', frame)
+            frame_bytes = jpeg.tobytes()
+            with self.condition:
+                self.frame_bytes = frame_bytes
+                self.condition.notify_all()
+        except Exception as e:
+            print(f"[-] Error encoding frame to JPEG: {e}")
 
     def close(self):
-        if self.process:
-            try:
-                self.process.stdin.close()
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except Exception:
-                pass
-            self.process = None
-            print("[*] Streaming connection closed.")
+        if self.server:
+            print("[*] Stopping HTTP server...")
+            self.server.shutdown()
+            self.server.server_close()
+            with self.condition:
+                self.frame_bytes = None
+                self.condition.notify_all()
+            self.server_thread.join(timeout=2)
+            self.server = None
+            print("[*] HTTP server stopped.")
 
 
 class Track:
@@ -424,10 +496,15 @@ def get_args():
         help="Json file containing bboxes of areas",
     )
     parser.add_argument(
-        "--rtsp-url",
-        type=str,
-        default=None,
-        help="RTSP URL of the MediaMTX stream endpoint (e.g. rtsp://localhost:8554/mystream)"
+        "--stream",
+        action="store_true",
+        help="Stream the live video over HTTP on port 8000 (accessible via cloudflared tunnel)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to stream the live video on (default: 8000)"
     )
     return parser.parse_args()
     
@@ -515,10 +592,10 @@ def start_area_count_demo():
                                 label=label,
                             )
                 
-                #-----Stream to RTSP (MediaMTX)-----
-                if args.rtsp_url:
+                #-----Stream to HTTP-----
+                if args.stream:
                     if streamer is None:
-                        streamer = RTSPStreamer(args.rtsp_url, frame.width, frame.height)
+                        streamer = HTTPStreamer(port=args.port)
                     streamer.push_frame(frame.image)
 
                 try:
