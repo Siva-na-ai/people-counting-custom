@@ -21,7 +21,7 @@ import torch
 import numpy as np
 import subprocess
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from modlib.apps.annotate import ColorPalette, Annotator, Color
 from modlib.apps.area import Area
@@ -139,6 +139,9 @@ class StreamingHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(frame_bytes)
                     self.wfile.write(b'\r\n')
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                print(f"[*] Client disconnected: {e}")
             except Exception:
                 # Connection reset or browser closed tab
                 pass
@@ -159,7 +162,7 @@ class HTTPStreamer:
             streamer = self
 
         try:
-            self.server = HTTPServer(('0.0.0.0', self.port), CustomHandler)
+            self.server = ThreadingHTTPServer(('0.0.0.0', self.port), CustomHandler)
             self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.server_thread.start()
             print(f"[*] Started HTTP MJPEG server at http://localhost:{self.port}")
