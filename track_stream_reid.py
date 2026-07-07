@@ -340,6 +340,74 @@ class BoTSORTTracker:
             return tracked_arr
 
 
+import threading
+import urllib.request
+import json
+
+def send_data_to_dashboard(inside, outside, unique, visitors=None):
+    if visitors is None:
+        visitors = []
+    
+    payload = {
+        "inside": inside,
+        "outside": outside,
+        "unique": unique,
+        "visitors": visitors
+    }
+    
+    def run():
+        try:
+            req = urllib.request.Request(
+                'http://localhost:8000/api/update',
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=0.5) as r:
+                r.read()
+        except Exception:
+            pass  # Fail silently if local dashboard server is not running
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+
+
+LAST_FRAME_TIME = 0.0
+FRAME_INTERVAL = 0.1  # max 10 fps
+
+def send_frame_to_dashboard(frame_image):
+    global LAST_FRAME_TIME
+    import time
+    current_time = time.time()
+    if current_time - LAST_FRAME_TIME < FRAME_INTERVAL:
+        return
+    LAST_FRAME_TIME = current_time
+    
+    try:
+        _, jpeg_bytes = cv2.imencode('.jpg', frame_image, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        data = jpeg_bytes.tobytes()
+        
+        def run():
+            try:
+                req = urllib.request.Request(
+                    'http://localhost:8000/api/upload_frame',
+                    data=data,
+                    headers={'Content-Type': 'image/jpeg'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=0.5) as r:
+                    r.read()
+            except Exception:
+                pass
+                
+        t = threading.Thread(target=run)
+        t.daemon = True
+        t.start()
+    except Exception:
+        pass
+
+
 def main():
     #-----Camera and AI setup-----
     device = AiCamera()
@@ -362,8 +430,26 @@ def main():
             detections = tracker.update(frame.image, detections)
 
             #-----ReID / Unique Visitor Count-----
+            current_visitors = []
             for idx, (_, s, c, t) in enumerate(detections):
-                unique_seen_people.add(t)
+                track_id_val = int(t.item()) if hasattr(t, 'item') else int(t)
+                conf_val = float(s.item()) if hasattr(s, 'item') else float(s)
+                unique_seen_people.add(track_id_val)
+                current_visitors.append({
+                    "id": track_id_val,
+                    "confidence": conf_val,
+                    "area": "Main Coverage",
+                    "color": "#10b981",
+                    "lastSeen": "Just Now"
+                })
+
+            # Send stats to dashboard server
+            send_data_to_dashboard(
+                inside=len(detections),
+                outside=0,
+                unique=len(unique_seen_people),
+                visitors=current_visitors
+            )
 
             #-----Display Annotations-----
             annotator.set_label(
@@ -380,6 +466,8 @@ def main():
                 labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
                 
             annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
+
+            send_frame_to_dashboard(frame.image)
 
             frame.display()
 

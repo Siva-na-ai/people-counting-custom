@@ -70,6 +70,16 @@ python area_count_reid.py --json-file areas.json
 ]
 ```
 
+### 3. Web Dashboard (Frontend)
+To run the web dashboard frontend and start the server:
+```bash
+python server.py
+```
+After starting the server, open your web browser and navigate to:
+```
+http://localhost:8000
+```
+
 ---
 
 ## 💡 How ReID with OSNet Works

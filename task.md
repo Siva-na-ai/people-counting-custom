@@ -1,0 +1,8 @@
+- [x] Create custom server script `dashboard/server.py`
+- [x] Add the non-blocking sender function and update `track_stream_reid.py` main loop
+- [x] Add the non-blocking sender function and update `area_count_reid.py` main loop
+- [x] Update `dashboard/dashboard.js` to poll data from `/api/data` and handle offline/online states
+- [x] Kill the default HTTP background server task
+- [x] Propose running the custom server script
+- [x] Verify the live syncing between camera scripts and the web dashboard
+- [x] Capture verified results in `walkthrough.md`

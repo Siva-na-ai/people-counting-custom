@@ -366,6 +366,74 @@ def get_args():
     )
     return parser.parse_args()
     
+import threading
+import urllib.request
+import json
+
+def send_data_to_dashboard(inside, outside, unique, visitors=None):
+    if visitors is None:
+        visitors = []
+    
+    payload = {
+        "inside": inside,
+        "outside": outside,
+        "unique": unique,
+        "visitors": visitors
+    }
+    
+    def run():
+        try:
+            req = urllib.request.Request(
+                'http://localhost:8000/api/update',
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=0.5) as r:
+                r.read()
+        except Exception:
+            pass  # Fail silently if local dashboard server is not running
+
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+
+
+LAST_FRAME_TIME = 0.0
+FRAME_INTERVAL = 0.1  # max 10 fps
+
+def send_frame_to_dashboard(frame_image):
+    global LAST_FRAME_TIME
+    import time
+    current_time = time.time()
+    if current_time - LAST_FRAME_TIME < FRAME_INTERVAL:
+        return
+    LAST_FRAME_TIME = current_time
+    
+    try:
+        _, jpeg_bytes = cv2.imencode('.jpg', frame_image, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        data = jpeg_bytes.tobytes()
+        
+        def run():
+            try:
+                req = urllib.request.Request(
+                    'http://localhost:8000/api/upload_frame',
+                    data=data,
+                    headers={'Content-Type': 'image/jpeg'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=0.5) as r:
+                    r.read()
+            except Exception:
+                pass
+                
+        t = threading.Thread(target=run)
+        t.daemon = True
+        t.start()
+    except Exception:
+        pass
+
+
 def start_area_count_demo():
     #-----Camera and AI setup-----
     args = get_args()
@@ -383,6 +451,7 @@ def start_area_count_demo():
     # Initialize BoTSORT Tracker (combining tracking and ReID)
     tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900)
     
+    unique_seen_people = set()
     annotator = Annotator(
         color=ColorPalette.default(), thickness=1, text_thickness=1, text_scale=0.4
     )
@@ -395,6 +464,11 @@ def start_area_count_demo():
             #-----Tracker Update-----
             detections = tracker.update(frame.image, detections)
             
+            #-----Track Unique visitors-----
+            for det in detections:
+                track_id_val = int(det[3].item()) if hasattr(det[3], 'item') else int(det[3])
+                unique_seen_people.add(track_id_val)
+
             #-----Display Annotations-----
             labels = []
             for idx, (_, s, c, t) in enumerate(detections):
@@ -408,9 +482,27 @@ def start_area_count_demo():
                 alpha=0.2,
             )
             
+            sum_inside = 0
+            outside_count = 0
+            current_visitors = []
+
             if len(areas) == 0:
                 #-----Count and show all people-----
                 total_people = len(detections)
+                sum_inside = total_people
+                outside_count = 0
+
+                for det in detections:
+                    track_id_val = int(det[3].item()) if hasattr(det[3], 'item') else int(det[3])
+                    conf_val = float(det[1].item()) if hasattr(det[1], 'item') else float(det[1])
+                    current_visitors.append({
+                        "id": track_id_val,
+                        "confidence": conf_val,
+                        "area": "Main Coverage",
+                        "color": "#10b981",
+                        "lastSeen": "Just Now"
+                    })
+
                 label = f"Total People Count: {total_people}"
                 annotator.set_label(
                     image=frame.image,
@@ -423,6 +515,19 @@ def start_area_count_demo():
                 for ID, area in enumerate(areas):
                     #-----Area-----
                     d = detections[area.contains(detections)]
+                    sum_inside += len(d)
+
+                    for det in d:
+                        track_id_val = int(det[3].item()) if hasattr(det[3], 'item') else int(det[3])
+                        conf_val = float(det[1].item()) if hasattr(det[1], 'item') else float(det[1])
+                        current_visitors.append({
+                            "id": track_id_val,
+                            "confidence": conf_val,
+                            "area": f"Area {ID + 1}",
+                            "color": "#10b981" if ID == 0 else "#3b82f6",
+                            "lastSeen": "Just Now"
+                        })
+
                     #-----Visualize Detections-----
                     frame.image = annotator.annotate_area(
                         frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
@@ -447,6 +552,18 @@ def start_area_count_demo():
                             color=(0, 255, 255),
                             label=label,
                         )
+                outside_count = len(detections) - sum_inside
+
+            # Send stats to dashboard server
+            send_data_to_dashboard(
+                inside=len(detections),
+                outside=0,
+                unique=len(unique_seen_people),
+                visitors=current_visitors
+            )
+
+            send_frame_to_dashboard(frame.image)
+
             frame.display()
 
 
