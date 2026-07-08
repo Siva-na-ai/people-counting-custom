@@ -753,7 +753,8 @@ def start_area_count_demo():
     args = get_args()
 
     model = NanoDetPlus416x416()
-    device = AiCamera(camera_id="")
+    device = AiCamera()
+    device.camera_id = ""
     device.deploy(model)
 
     areas = []
