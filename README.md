@@ -89,12 +89,12 @@ To run the application, configure your zones interactively, trace transitions (I
    ```bash
    python area_count_reid.py --zones --camera-id 1
    ```
-   *Note: If no zones are saved in the DB for the specified `--camera-id`, the script opens an interactive OpenCV GUI. Click points to define the vertices of the **IN** polygon, press **Enter**, then click points to define the **OUT** polygon, and press **Enter** to save them to the DB and start tracking.*
+    *Note: If no crossing line is saved in the DB for the specified `--camera-id`, the script opens an interactive OpenCV GUI. Click twice to define the two endpoints of the crossing line, and press **Enter** to save it to the DB and start tracking.*
 
-   To redraw the zones and overwrite the existing configuration in the DB, run:
-   ```bash
-   python area_count_reid.py --zones --camera-id 1 --redraw
-   ```
+    To redraw the crossing line and overwrite the existing configuration in the DB, run:
+    ```bash
+    python area_count_reid.py --zones --camera-id 1 --redraw
+    ```
 
    To run with the live HTTP MJPEG stream (accessible on port 8000 by default):
    ```bash
