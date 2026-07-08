@@ -1,2 +1,20 @@
 .env
 .env.example
+# Environment variables
+.env
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Operating system files
+.DS_Store
+Thumbs.db
