@@ -54,7 +54,7 @@ To run the application, configure your zones interactively, trace transitions (I
    DB_USER="your_user"
    DB_PASSWORD="your_password"
    DB_SSLMODE="require"  # 'prefer', 'require', or 'disable'
-   CAMERA_ID=1           # Camera ID identifying records in the DB
+   DB_CAMERA_ID=1        # Camera ID identifying records in the DB
    ```
 
 2. **Verify/Run DB Schema**:
