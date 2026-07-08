@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import os
 import json
 import argparse
 import cv2
@@ -21,6 +22,11 @@ import torch
 import numpy as np
 import subprocess
 import threading
+import queue
+import time
+from datetime import datetime
+import psycopg2
+from dotenv import load_dotenv
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from modlib.apps.annotate import ColorPalette, Annotator, Color
@@ -28,6 +34,10 @@ from modlib.apps.area import Area
 from modlib.devices import AiCamera
 from modlib.models.zoo import NanoDetPlus416x416
 from scipy.optimize import linear_sum_assignment
+
+# Load environment variables
+load_dotenv()
+
 
 try:
     import torchreid
@@ -190,6 +200,209 @@ class HTTPStreamer:
             self.server_thread.join(timeout=2)
             self.server = None
             print("[*] HTTP server stopped.")
+
+
+# Global database queue and connection function
+db_queue = queue.Queue()
+
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", "5432"),
+            database=os.getenv("DB_NAME", "people_counting"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", ""),
+            sslmode=os.getenv("DB_SSLMODE", "prefer")
+        )
+        return conn
+    except Exception as e:
+        print(f"[-] Database connection failed: {e}")
+        return None
+
+
+def db_worker():
+    while True:
+        item = db_queue.get()
+        if item is None:
+            break
+        task_type, data = item
+        if task_type == "save_zones":
+            camera_id, points_in, points_out = data
+            conn = get_db_connection()
+            if conn is not None:
+                try:
+                    with conn.cursor() as cur:
+                        # Upsert IN zone
+                        cur.execute(
+                            "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'in'",
+                            (camera_id,)
+                        )
+                        row_in = cur.fetchone()
+                        if row_in:
+                            cur.execute(
+                                "UPDATE public.zones SET points = %s WHERE zone_id = %s",
+                                (json.dumps(points_in), row_in[0])
+                            )
+                        else:
+                            cur.execute(
+                                "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
+                                (camera_id, f"Camera {camera_id} IN Zone", "Interactive IN Zone", "in", json.dumps(points_in))
+                            )
+                        
+                        # Upsert OUT zone
+                        cur.execute(
+                            "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'out'",
+                            (camera_id,)
+                        )
+                        row_out = cur.fetchone()
+                        if row_out:
+                            cur.execute(
+                                "UPDATE public.zones SET points = %s WHERE zone_id = %s",
+                                (json.dumps(points_out), row_out[0])
+                            )
+                        else:
+                            cur.execute(
+                                "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
+                                (camera_id, f"Camera {camera_id} OUT Zone", "Interactive OUT Zone", "out", json.dumps(points_out))
+                            )
+                        conn.commit()
+                        print(f"[+] Saved zones for camera {camera_id} to database.")
+                except Exception as e:
+                    print(f"[-] Failed to save zones to database: {e}")
+                finally:
+                    conn.close()
+                    
+        elif task_type == "update_hourly":
+            camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ = data
+            conn = get_db_connection()
+            if conn is not None:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT id FROM public.people_count_hourly WHERE camera_id = %s AND report_date = %s AND report_hour = %s",
+                            (camera_id, report_date, report_hour)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            cur.execute(
+                                """UPDATE public.people_count_hourly 
+                                   SET total_in = %s, total_out = %s, peak_occupancy = %s, avg_occupancy = %s, created_at = NOW() 
+                                   WHERE id = %s""",
+                                (total_in, total_out, peak_occ, avg_occ, row[0])
+                            )
+                        else:
+                            cur.execute(
+                                """INSERT INTO public.people_count_hourly (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, avg_occupancy, created_at) 
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
+                                (camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ)
+                            )
+                        conn.commit()
+                except Exception as e:
+                    print(f"[-] Database hourly count update failed: {e}")
+                finally:
+                    conn.close()
+        db_queue.task_done()
+
+def load_zones_from_db(camera_id):
+    conn = get_db_connection()
+    if conn is None:
+        return None, None
+    points_in, points_out = None, None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT zone_type, points FROM public.zones WHERE camera_id = %s",
+                (camera_id,)
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                zone_type, points_data = row
+                if isinstance(points_data, str):
+                    pts = json.loads(points_data)
+                else:
+                    pts = points_data  # psycopg2 handles json/jsonb columns as dict/list automatically
+                if zone_type == "in":
+                    points_in = pts
+                elif zone_type == "out":
+                    points_out = pts
+    except Exception as e:
+        print(f"[-] Failed to load zones from database: {e}")
+    finally:
+        conn.close()
+    return points_in, points_out
+
+def draw_zones_interactively(device):
+    print("[*] Opening camera stream to capture a frame for zone definition...")
+    frame_image = None
+    with device as stream:
+        for frame in stream:
+            frame_image = frame.image.copy()
+            break
+            
+    if frame_image is None:
+        raise Exception("Failed to capture frame from camera for drawing zones.")
+        
+    points_in = []
+    points_out = []
+    current_points = []
+    phase = "IN"  # "IN" or "OUT"
+    
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal current_points
+        if event == cv2.EVENT_LBUTTONDOWN:
+            h, w = frame_image.shape[:2]
+            current_points.append([float(x / w), float(y / h)])
+            
+    window_name = "Define Zones - Left Click to add points. Enter/n to confirm. Q to Quit"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    print(f"[*] Define {phase} Zone: Click points on the image. Press ENTER or 'n' when finished.")
+    
+    while True:
+        temp_img = frame_image.copy()
+        h, w = temp_img.shape[:2]
+        
+        # Draw current points and lines
+        for pt in current_points:
+            cv2.circle(temp_img, (int(pt[0]*w), int(pt[1]*h)), 5, (0, 255, 0) if phase == "IN" else (0, 0, 255), -1)
+        if len(current_points) > 1:
+            pts_array = np.array([[int(pt[0]*w), int(pt[1]*h)] for pt in current_points], dtype=np.int32)
+            cv2.polylines(temp_img, [pts_array], isClosed=False, color=(0, 255, 0) if phase == "IN" else (0, 0, 255), thickness=2)
+            
+        # Draw completed IN zone if defining OUT zone
+        if phase == "OUT" and len(points_in) > 0:
+            pts_array_in = np.array([[int(pt[0]*w), int(pt[1]*h)] for pt in points_in], dtype=np.int32)
+            cv2.polylines(temp_img, [pts_array_in], isClosed=True, color=(0, 255, 255), thickness=2)
+            
+        # Overlay instruction text
+        cv2.putText(temp_img, f"Define {phase} Zone. Click points. Press ENTER/n to confirm.", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        cv2.imshow(window_name, temp_img)
+        key = cv2.waitKey(30) & 0xFF
+        
+        if key == 13 or key == ord('n'):  # Enter or 'n' key
+            if phase == "IN":
+                if len(current_points) < 3:
+                    print("[-] Please define at least 3 points for the IN zone polygon.")
+                    continue
+                points_in = current_points.copy()
+                current_points = []
+                phase = "OUT"
+                print("[*] Define OUT Zone: Click points on the image. Press ENTER or 'q' when finished.")
+            elif phase == "OUT":
+                if len(current_points) < 3:
+                    print("[-] Please define at least 3 points for the OUT zone polygon.")
+                    continue
+                points_out = current_points.copy()
+                break
+        elif key == ord('q'):
+            break
+            
+    cv2.destroyWindow(window_name)
+    return points_in, points_out
 
 
 class Track:
@@ -509,7 +722,24 @@ def get_args():
         default=8000,
         help="Port to stream the live video on (default: 8000)"
     )
+    parser.add_argument(
+        "--zones",
+        action="store_true",
+        help="Use IN and OUT zones configuration from DB or interactive setup"
+    )
+    parser.add_argument(
+        "--redraw",
+        action="store_true",
+        help="Force interactive zone drawing even if zones are already in the DB"
+    )
+    parser.add_argument(
+        "--camera-id",
+        type=int,
+        default=1,
+        help="Camera identifier for database records"
+    )
     return parser.parse_args()
+
     
 def start_area_count_demo():
     #-----Camera and AI setup-----
@@ -520,7 +750,43 @@ def start_area_count_demo():
     device.deploy(model)
 
     areas = []
-    if args.json_file is not None:
+    
+    # Start the DB worker thread
+    db_thread = threading.Thread(target=db_worker, daemon=True)
+    db_thread.start()
+
+    camera_id = args.camera_id
+    using_zones = args.zones
+    
+    if using_zones:
+        points_in, points_out = None, None
+        if not args.redraw:
+            # Try loading from DB
+            points_in, points_out = load_zones_from_db(camera_id)
+            if points_in and points_out:
+                print(f"[*] Loaded existing IN and OUT zones for camera {camera_id} from DB.")
+        
+        if not points_in or not points_out:
+            # Must draw them
+            try:
+                points_in, points_out = draw_zones_interactively(device)
+                if points_in and points_out:
+                    # Save to DB
+                    db_queue.put(("save_zones", (camera_id, points_in, points_out)))
+                else:
+                    print("[-] Zone creation cancelled or failed. Exiting.")
+                    db_queue.put(None)
+                    return
+            except Exception as e:
+                print(f"[-] Error defining zones interactively: {e}")
+                print("[-] Please run in a GUI environment or provide pre-defined zones.")
+                db_queue.put(None)
+                return
+
+        # Add Areas
+        areas.append(Area(points_in))
+        areas.append(Area(points_out))
+    elif args.json_file is not None:
         json_areas = json_regions_extraction(args.json_file)
         for area in json_areas: 
             areas.append(Area(area["points"]))
@@ -531,6 +797,24 @@ def start_area_count_demo():
     annotator = Annotator(
         color=ColorPalette.default(), thickness=1, text_thickness=1, text_scale=0.4
     )
+    
+    # Variables for database metrics and transition counting
+    hourly_in_count = 0
+    hourly_out_count = 0
+    peak_occupancy = 0
+    occupancy_records = []
+    
+    # track_id -> list of zones visited: e.g. ['in'] or ['out'] or ['in', 'out'] etc.
+    track_zone_history = {}
+    # track_id -> timestamp of last transition trigger
+    track_last_trigger = {}
+    
+    current_time = datetime.now()
+    current_hour = current_time.hour
+    current_date = current_time.date()
+    
+    last_db_write_time = time.time()
+    
     streamer = None
     try:
         with device as stream:
@@ -542,6 +826,81 @@ def start_area_count_demo():
                 #-----Tracker Update-----
                 detections = tracker.update(frame.image, detections)
                 
+                # Track current occupancy (total active people in frame)
+                current_occupancy = len(detections)
+                occupancy_records.append(current_occupancy)
+                if current_occupancy > peak_occupancy:
+                    peak_occupancy = current_occupancy
+                
+                current_time_secs = time.time()
+                
+                # Check for hour rollover
+                now = datetime.now()
+                if now.hour != current_hour or now.date() != current_date:
+                    # Sync previous hour's data one last time
+                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                    
+                    # Reset counters for the new hour
+                    current_hour = now.hour
+                    current_date = now.date()
+                    hourly_in_count = 0
+                    hourly_out_count = 0
+                    peak_occupancy = current_occupancy
+                    occupancy_records = [current_occupancy]
+                    track_zone_history.clear()
+                    track_last_trigger.clear()
+                
+                if using_zones and len(areas) == 2:
+                    in_mask = areas[0].contains(detections)
+                    out_mask = areas[1].contains(detections)
+                    
+                    for idx, (_, _, _, t) in enumerate(detections):
+                        is_in = in_mask[idx]
+                        is_out = out_mask[idx]
+                        
+                        # Apply 5-second cooldown on transitions to prevent oscillation at borders
+                        last_trig = track_last_trigger.get(t, 0.0)
+                        if current_time_secs - last_trig < 5.0:
+                            continue
+                            
+                        if is_in:
+                            if t not in track_zone_history:
+                                track_zone_history[t] = ['in']
+                                track_last_trigger[t] = current_time_secs
+                            elif track_zone_history[t][-1] == 'out':
+                                track_zone_history[t].append('in')
+                                track_last_trigger[t] = current_time_secs
+                                hourly_in_count += 1
+                                print(f"[+] Person #{t} Entered (OUT -> IN). Hourly IN: {hourly_in_count}")
+                                # Push update to DB queue immediately
+                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                
+                        elif is_out:
+                            if t not in track_zone_history:
+                                track_zone_history[t] = ['out']
+                                track_last_trigger[t] = current_time_secs
+                            elif track_zone_history[t][-1] == 'in':
+                                track_zone_history[t].append('out')
+                                track_last_trigger[t] = current_time_secs
+                                hourly_out_count += 1
+                                print(f"[-] Person #{t} Exited (IN -> OUT). Hourly OUT: {hourly_out_count}")
+                                # Push update to DB queue immediately
+                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                
+                    # Clean up tracked histories for aged-out tracks to prevent memory leak
+                    active_track_ids = {track.track_id for track in tracker.tracks}
+                    track_zone_history = {tid: hist for tid, hist in track_zone_history.items() if tid in active_track_ids}
+                    track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
+                    
+                # Periodic database sync (every 10 seconds)
+                if current_time_secs - last_db_write_time > 10.0:
+                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                    last_db_write_time = current_time_secs
+
                 #-----Display Annotations-----
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
@@ -555,34 +914,48 @@ def start_area_count_demo():
                     alpha=0.2,
                 )
                 
-                if len(areas) == 0:
-                    #-----Count and show all people-----
-                    total_people = len(detections)
-                    label = f"Total People Count: {total_people}"
+                if using_zones and len(areas) == 2:
+                    # Draw IN zone (greenish-cyan)
+                    frame.image = annotator.annotate_area(
+                        frame=frame, area=areas[0], color=(0, 255, 0), alpha=0.15,
+                    )
+                    # Draw OUT zone (reddish-orange)
+                    frame.image = annotator.annotate_area(
+                        frame=frame, area=areas[1], color=(0, 0, 255), alpha=0.15,
+                    )
+                    
+                    # Labels on top left
                     annotator.set_label(
                         image=frame.image,
                         x=20,
-                        y=40,
-                        color=(0, 255, 255),
-                        label=label,
+                        y=30,
+                        color=(0, 255, 0),
+                        label=f"Hourly IN: {hourly_in_count}",
                     )
-                else:
-                    for ID, area in enumerate(areas):
-                        #-----Area-----
-                        d = detections[area.contains(detections)]
-                        #-----Visualize Detections-----
-                        frame.image = annotator.annotate_area(
-                            frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
-                        )
-                        text_labels = [
-                            "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
-                            "Area ID: " + str(ID + 1),
-                        ]
-
-                        for index, label in enumerate(text_labels):
+                    annotator.set_label(
+                        image=frame.image,
+                        x=20,
+                        y=55,
+                        color=(0, 0, 255),
+                        label=f"Hourly OUT: {hourly_out_count}",
+                    )
+                    annotator.set_label(
+                        image=frame.image,
+                        x=20,
+                        y=80,
+                        color=(255, 255, 255),
+                        label=f"Occupancy: {current_occupancy}",
+                    )
+                    
+                    # Label the zones themselves
+                    for idx, (label_name, color) in enumerate([("IN Zone", (0, 255, 0)), ("OUT Zone", (0, 0, 255))]):
+                        area = areas[idx]
+                        num_people = sum(1 for x in detections[area.contains(detections)] if x)
+                        text_labels = [f"{label_name}", f"Count: {num_people}"]
+                        for index, lbl in enumerate(text_labels):
                             font = cv2.FONT_HERSHEY_SIMPLEX
                             text_width, text_height = cv2.getTextSize(
-                                text=label,
+                                text=lbl,
                                 fontFace=font,
                                 fontScale=0.5,
                                 thickness=1,
@@ -590,10 +963,50 @@ def start_area_count_demo():
                             annotator.set_label(
                                 image=frame.image,
                                 x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
-                                y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
-                                color=(0, 255, 255),
-                                label=label,
+                                y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 20)) - int(2 * text_height),
+                                color=color,
+                                label=lbl,
                             )
+                else:
+                    if len(areas) == 0:
+                        #-----Count and show all people-----
+                        total_people = len(detections)
+                        label = f"Total People Count: {total_people}"
+                        annotator.set_label(
+                            image=frame.image,
+                            x=20,
+                            y=40,
+                            color=(0, 255, 255),
+                            label=label,
+                        )
+                    else:
+                        for ID, area in enumerate(areas):
+                            #-----Area-----
+                            d = detections[area.contains(detections)]
+                            #-----Visualize Detections-----
+                            frame.image = annotator.annotate_area(
+                                frame=frame, area=area, color=(0, 255, 255), alpha = 0.2,
+                            )
+                            text_labels = [
+                                "In Area: " + str(sum(1 for x in d if x)), #Get Number of people in each Area
+                                "Area ID: " + str(ID + 1),
+                            ]
+
+                            for index, label in enumerate(text_labels):
+                                font = cv2.FONT_HERSHEY_SIMPLEX
+                                text_width, text_height = cv2.getTextSize(
+                                    text=label,
+                                    fontFace=font,
+                                    fontScale=0.5,
+                                    thickness=1,
+                                )[0]
+                                annotator.set_label(
+                                    image=frame.image,
+                                    x=int(((area.points[0][0] +  area.points[1][0]) / 2) * frame.width) - int(text_width/2),
+                                    y=int(((area.points[0][1] +  area.points[2][1]) / 2)* frame.height + ((index) * 25)) - int(2 * text_height),
+                                    color=(0, 255, 255),
+                                    label=label,
+                                )
                 
                 #-----Stream to HTTP-----
                 if args.stream:
@@ -607,6 +1020,9 @@ def start_area_count_demo():
                     # Headless mode
                     pass
     finally:
+        # Stop background worker
+        db_queue.put(None)
+        db_thread.join(timeout=2)
         if streamer:
             streamer.close()
 
