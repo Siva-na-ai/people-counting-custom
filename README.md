@@ -43,34 +43,40 @@ python track_stream_reid.py
 ```
 
 ### 2. Area Counting Demo with ReID
-To count people inside specific polygonal areas, specify a JSON file containing the coordinates of the areas:
+To count people inside specific polygonal regions:
 ```bash
-python area_count_reid.py --json-file areas.json
-```
-
-#### JSON Areas Format Example
-```json
-[
-    {
-        "points": [
-            [0.1, 0.3],
-            [0.45, 0.3],
-            [0.45, 0.7],
-            [0.1, 0.7]
-        ]
-    },
-    {
-        "points": [
-            [0.55, 0.3],
-            [0.9, 0.3],
-            [0.9, 0.7],
-            [0.55, 0.7]
-        ]
-    }
-]
+python area_count_reid.py --stream
 ```
 
 ---
+
+## 📡 Device Registration & Heartbeat Module
+
+We have added a device tracking system consisting of a client daemon (`client.py`) that runs directly on the Raspberry Pi and connects to the PostgreSQL database.
+
+### How it collects Device Details
+*   **Device Name:** Retrieved using `socket.gethostname()`.
+*   **Model Name:** Read directly from the system file `/proc/device-tree/model` (with emulation fallback).
+*   **Serial Number:** Parsed from `/proc/cpuinfo` (extracts the `Serial` line, with MAC-address fallback).
+*   **CPU Temperature:** Monitored from `/sys/class/thermal/thermal_zone0/temp` (or fallback to `vcgencmd measure_temp` or random emulation).
+
+### Running the Client Daemon
+1.  **Configure environment:** Make sure the credentials in `.env` are set correctly.
+2.  **Start the Client Daemon on Raspberry Pi:**
+    ```bash
+    python client.py
+    ```
+3.  **Registration:**
+    On startup or reconnection, the client connects to PostgreSQL and checks if the device already exists (matching on `serial_no`):
+    *   If the device already exists, it updates its `device_name`, `model`, `status = 'ONLINE'`, and `last_seen`.
+    *   Otherwise, it inserts a new device entry.
+4.  **Heartbeats:**
+    Every 30 seconds, the client reads the current CPU temperature and updates the database row setting `status = 'ONLINE'`, `last_seen` timestamp, and current `temperature`.
+5.  **Offline Detection:**
+    In each heartbeat cycle, the client also executes an update query to transitions other devices to `"OFFLINE"` if they haven't sent a heartbeat for more than 120 seconds.
+
+---
+
 
 ## 💡 How ReID with OSNet Works
 
