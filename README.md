@@ -42,8 +42,67 @@ To run the standard tracking stream:
 python track_stream_reid.py
 ```
 
-### 2. Area Counting Demo with ReID
-To count people inside specific polygonal areas, specify a JSON file containing the coordinates of the areas:
+### 2. Area Counting & DB Logging (Interactive Zones Mode)
+To run the application, configure your zones interactively, trace transitions (IN vs. OUT), and log hourly counts to PostgreSQL:
+
+1. **Configure Environment Variables**:
+   Create a `.env` file in the root of the workspace:
+   ```env
+   DB_HOST="your_rds_or_postgres_host"
+   DB_PORT="5432"
+   DB_NAME="your_database_name"
+   DB_USER="your_user"
+   DB_PASSWORD="your_password"
+   DB_SSLMODE="require"  # 'prefer', 'require', or 'disable'
+   CAMERA_ID=1           # Camera ID identifying records in the DB
+   ```
+
+2. **Verify/Run DB Schema**:
+   Ensure your database has the following tables:
+   ```sql
+   -- Zones table (stores coordinates)
+   CREATE TABLE IF NOT EXISTS public.zones (
+       zone_id bigserial PRIMARY KEY,
+       zone_name varchar(100),
+       description text,
+       camera_id bigint,
+       zone_type varchar(20), -- 'in' or 'out'
+       points jsonb
+   );
+
+   -- Hourly aggregated stats
+   CREATE TABLE IF NOT EXISTS public.people_count_hourly (
+       id bigserial PRIMARY KEY,
+       camera_id bigint,
+       report_date date,
+       report_hour smallint,
+       total_in integer,
+       total_out integer,
+       peak_occupancy integer,
+       avg_occupancy numeric(6,2),
+       created_at timestamp without time zone DEFAULT now()
+   );
+   ```
+
+3. **Start the Demo**:
+   Run the area counter with the `--zones` CLI argument:
+   ```bash
+   python area_count_reid.py --zones --camera-id 1
+   ```
+   *Note: If no zones are saved in the DB for the specified `--camera-id`, the script opens an interactive OpenCV GUI. Click points to define the vertices of the **IN** polygon, press **Enter**, then click points to define the **OUT** polygon, and press **Enter** to save them to the DB and start tracking.*
+
+   To redraw the zones and overwrite the existing configuration in the DB, run:
+   ```bash
+   python area_count_reid.py --zones --camera-id 1 --redraw
+   ```
+
+   To run with the live HTTP MJPEG stream (accessible on port 8000 by default):
+   ```bash
+   python area_count_reid.py --zones --camera-id 1 --stream
+   ```
+
+### 3. Basic Area Counting (File-Based Mode)
+To count people inside static regions specified in a JSON file without database sync:
 ```bash
 python area_count_reid.py --json-file areas.json
 ```
@@ -74,9 +133,10 @@ python area_count_reid.py --json-file areas.json
 
 ## 💡 How ReID with OSNet Works
 
-1. **Object Tracking:** `BYTETracker` maintains short-term frame-to-frame association using motion dynamics and Kalman filters.
-2. **Feature Extraction:** When a new person is tracked, the script crops their bounding box from the frame, processes it, and passes it to the `osnet_x1_0` model (running locally on CPU) to extract a unique 512-dimensional embedding.
-3. **Similarity Search:** The extracted embedding is compared against a gallery of previously seen people using **Cosine Similarity**.
-4. **ID Association:** 
-   - If the similarity is above the threshold (default: `0.70`), the script maps the new tracker ID back to the existing `global_id`.
-   - If no match is found, a new `global_id` is created and stored in the gallery.
+1. **Object Tracking**: `BYTETracker` maintains short-term frame-to-frame association using motion dynamics and Kalman filters.
+2. **Feature Extraction**: When a new person is tracked, the script crops their bounding box from the frame, processes it, and passes it to the `osnet_x1_0` model (running locally on CPU) to extract a unique 512-dimensional embedding.
+3. **Similarity Search**: The extracted embedding is compared against a gallery of previously seen people using **Cosine Similarity**.
+4. **ID Association & State Transition**: 
+   - If the similarity is above the threshold (default: `0.58`), the script maps the new tracker ID back to the existing ID.
+   - For `--zones` mode, if a person travels from the OUT zone to the IN zone, they trigger an `IN` count. If they travel from the IN zone to the OUT zone, they trigger an `OUT` count.
+
