@@ -756,6 +756,13 @@ def get_args():
 def start_area_count_demo():
     #-----Camera and AI setup-----
     args = get_args()
+    
+    print("[*] Starting Application. Loaded Database configuration:")
+    print(f"    DB_HOST: {os.getenv('DB_HOST')}")
+    print(f"    DB_PORT: {os.getenv('DB_PORT')}")
+    print(f"    DB_NAME: {os.getenv('DB_NAME')}")
+    print(f"    DB_USER: {os.getenv('DB_USER')}")
+    print(f"    DB_SSLMODE: {os.getenv('DB_SSLMODE')}")
 
     model = NanoDetPlus416x416()
     device = AiCamera()
@@ -811,6 +818,8 @@ def start_area_count_demo():
     # Variables for database metrics and transition counting
     hourly_in_count = 0
     hourly_out_count = 0
+    session_in_count = 0
+    session_out_count = 0
     peak_occupancy = 0
     occupancy_records = []
     
@@ -822,6 +831,8 @@ def start_area_count_demo():
     track_history = {}
     # track_id -> starting cx coordinate (normalized)
     track_start_x = {}
+    # track_id -> starting cy coordinate (normalized)
+    track_start_y = {}
     # track_id -> "IN" or "OUT" (representing how they were counted)
     counted_tracks = {}
     
@@ -853,9 +864,10 @@ def start_area_count_demo():
                 # Check for hour rollover
                 now = datetime.now()
                 if now.hour != current_hour or now.date() != current_date:
-                    # Sync previous hour's data one last time
-                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                    # Sync previous hour's data one last time if there was activity
+                    if hourly_in_count > 0 or hourly_out_count > 0 or peak_occupancy > 0:
+                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                     
                     # Reset counters for the new hour
                     current_hour = now.hour
@@ -868,6 +880,7 @@ def start_area_count_demo():
                     track_last_trigger.clear()
                     track_history.clear()
                     track_start_x.clear()
+                    track_start_y.clear()
                     counted_tracks.clear()
                 
                 if using_zones and line_in and line_out:
@@ -904,15 +917,17 @@ def start_area_count_demo():
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                 else:
-                    # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT)
+                    # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT) and vertically (top to bottom is IN, bottom to top is OUT)
                     for idx, (box, _, _, t) in enumerate(detections):
                         cx = float((box[0] + box[2]) / 2.0)
                         cy = float((box[1] + box[3]) / 2.0)
                         current_center = [cx, cy]
                         
-                        # Store starting X coordinate
+                        # Store starting coordinates
                         if t not in track_start_x:
                             track_start_x[t] = cx
+                        if t not in track_start_y:
+                            track_start_y[t] = cy
                             
                         # Store history for trail drawing (absolute coordinates)
                         h_img, w_img = frame.image.shape[:2]
@@ -926,51 +941,67 @@ def start_area_count_demo():
                         prev_center = track_last_center.get(t)
                         track_last_center[t] = current_center
                         
-                        # Check for crossing detection using state machine
+                        # Check for crossing detection using state machine (checks both X and Y movement)
                         x_start = track_start_x[t]
+                        y_start = track_start_y[t]
                         x_diff = cx - x_start
+                        y_diff = cy - y_start
                         current_status = counted_tracks.get(t)
                         
                         if current_status is None:
                             # Not yet counted: can trigger IN or OUT
-                            if x_diff <= -0.15:
+                            # Coming near (IN): X decreases (moves right-to-left) or Y increases (moves downwards)
+                            if x_diff <= -0.15 or y_diff >= 0.15:
                                 hourly_in_count += 1
+                                session_in_count += 1
                                 counted_tracks[t] = "IN"
                                 track_start_x[t] = cx  # Reset baseline
-                                print(f"[+] Person #{t} moved near (IN). Net horizontal movement: {x_diff:.2f}")
+                                track_start_y[t] = cy
+                                print(f"[+] Person #{t} moved near (IN). Net movement: x_diff={x_diff:.2f}, y_diff={y_diff:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
-                            elif x_diff >= 0.15:
+                            # Going far (OUT): X increases (moves left-to-right) or Y decreases (moves upwards)
+                            elif x_diff >= 0.15 or y_diff <= -0.15:
                                 hourly_out_count += 1
+                                session_out_count += 1
                                 counted_tracks[t] = "OUT"
                                 track_start_x[t] = cx  # Reset baseline
-                                print(f"[-] Person #{t} moved far (OUT). Net horizontal movement: {x_diff:.2f}")
+                                track_start_y[t] = cy
+                                print(f"[-] Person #{t} moved far (OUT). Net movement: x_diff={x_diff:.2f}, y_diff={y_diff:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                         
                         elif current_status == "IN":
-                            # Last counted as IN (moving left): track the furthest left position reached
-                            track_start_x[t] = min(track_start_x[t], cx)
-                            # Can trigger OUT if they walk back to the right from their furthest left position
-                            turnaround_diff = cx - track_start_x[t]
-                            if turnaround_diff >= 0.15:
+                            # Last counted as IN: update limits
+                            track_start_x[t] = min(track_start_x[t], cx) # furthest left
+                            track_start_y[t] = max(track_start_y[t], cy) # furthest down
+                            # Can trigger OUT if they walk back away from camera
+                            turnaround_x = cx - track_start_x[t]
+                            turnaround_y = cy - track_start_y[t]
+                            if turnaround_x >= 0.15 or turnaround_y <= -0.15:
                                 hourly_out_count += 1
+                                session_out_count += 1
                                 counted_tracks[t] = "OUT"
                                 track_start_x[t] = cx  # Reset baseline
-                                print(f"[-] Person #{t} turned around and moved far (OUT). Net turnaround: {turnaround_diff:.2f}")
+                                track_start_y[t] = cy
+                                print(f"[-] Person #{t} turned around and moved far (OUT). Net turnaround: tx={turnaround_x:.2f}, ty={turnaround_y:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
                         elif current_status == "OUT":
-                            # Last counted as OUT (moving right): track the furthest right position reached
-                            track_start_x[t] = max(track_start_x[t], cx)
-                            # Can trigger IN if they walk back to the left from their furthest right position
-                            turnaround_diff = cx - track_start_x[t]
-                            if turnaround_diff <= -0.15:
+                            # Last counted as OUT: update limits
+                            track_start_x[t] = max(track_start_x[t], cx) # furthest right
+                            track_start_y[t] = min(track_start_y[t], cy) # furthest up
+                            # Can trigger IN if they walk back towards camera
+                            turnaround_x = cx - track_start_x[t]
+                            turnaround_y = cy - track_start_y[t]
+                            if turnaround_x <= -0.15 or turnaround_y >= 0.15:
                                 hourly_in_count += 1
+                                session_in_count += 1
                                 counted_tracks[t] = "IN"
                                 track_start_x[t] = cx  # Reset baseline
-                                print(f"[+] Person #{t} turned around and moved near (IN). Net turnaround: {turnaround_diff:.2f}")
+                                track_start_y[t] = cy
+                                print(f"[+] Person #{t} turned around and moved near (IN). Net turnaround: tx={turnaround_x:.2f}, ty={turnaround_y:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
@@ -978,13 +1009,15 @@ def start_area_count_demo():
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_start_x = {tid: x_val for tid, x_val in track_start_x.items() if tid in active_track_ids}
+                    track_start_y = {tid: y_val for tid, y_val in track_start_y.items() if tid in active_track_ids}
                     track_history = {tid: pts for tid, pts in track_history.items() if tid in active_track_ids}
                     counted_tracks = {tid: status for tid, status in counted_tracks.items() if tid in active_track_ids}
                     
-                # Periodic database sync (every 10 seconds)
+                # Periodic database sync (every 10 seconds) - ONLY if database activity exists
                 if current_time_secs - last_db_write_time > 10.0:
-                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                    if hourly_in_count > 0 or hourly_out_count > 0 or peak_occupancy > 0:
+                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                     last_db_write_time = current_time_secs
 
                 #-----Display Annotations-----
@@ -1069,14 +1102,14 @@ def start_area_count_demo():
                             x=20,
                             y=30,
                             color=(0, 255, 0),
-                            label=f"Hourly IN: {hourly_in_count}",
+                            label=f"Hourly IN: {hourly_in_count} | Session IN: {session_in_count}",
                         )
                         annotator.set_label(
                             image=frame.image,
                             x=20,
                             y=55,
                             color=(0, 0, 255),
-                            label=f"Hourly OUT: {hourly_out_count}",
+                            label=f"Hourly OUT: {hourly_out_count} | Session OUT: {session_out_count}",
                         )
                         annotator.set_label(
                             image=frame.image,
