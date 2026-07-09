@@ -818,8 +818,12 @@ def start_area_count_demo():
     track_last_center = {}
     # track_id -> timestamp of last transition trigger
     track_last_trigger = {}
-    # Keep track of unique track IDs seen in the current hour/session (used when not using zones)
-    seen_track_ids = set()
+    # track_id -> list of recent center points (absolute coordinates for drawing)
+    track_history = {}
+    # track_id -> starting cy coordinate (normalized)
+    track_start_y = {}
+    # set of track_ids that have been counted in the current session
+    counted_tracks = set()
     
     current_time = datetime.now()
     current_hour = current_time.hour
@@ -862,7 +866,9 @@ def start_area_count_demo():
                     occupancy_records = [current_occupancy]
                     track_last_center.clear()
                     track_last_trigger.clear()
-                    seen_track_ids.clear()
+                    track_history.clear()
+                    track_start_y.clear()
+                    counted_tracks.clear()
                 
                 if using_zones and line_in and line_out:
                     for idx, (box, _, _, t) in enumerate(detections):
@@ -898,39 +904,54 @@ def start_area_count_demo():
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                 else:
-                    # Non-zones mode: track unique people crossing a virtual horizontal line at Y = 0.55
+                    # Non-zones mode: track movement direction based on starting position and draw trails
                     for idx, (box, _, _, t) in enumerate(detections):
                         cx = float((box[0] + box[2]) / 2.0)
                         cy = float((box[1] + box[3]) / 2.0)
                         current_center = [cx, cy]
                         
+                        # Store starting Y coordinate
+                        if t not in track_start_y:
+                            track_start_y[t] = cy
+                            
+                        # Store history for trail drawing (absolute coordinates)
+                        h_img, w_img = frame.image.shape[:2]
+                        pt_abs = (int(cx * w_img), int(cy * h_img))
+                        if t not in track_history:
+                            track_history[t] = []
+                        track_history[t].append(pt_abs)
+                        if len(track_history[t]) > 30:
+                            track_history[t].pop(0)
+                            
                         prev_center = track_last_center.get(t)
                         track_last_center[t] = current_center
                         
-                        if prev_center is not None:
-                            prev_cy = prev_center[1]
-                            last_trig = track_last_trigger.get(t, 0.0)
-                            if current_time_secs - last_trig >= 5.0:
-                                # Coming near to camera (IN): Y increases past 0.55
-                                if prev_cy <= 0.55 and cy > 0.55:
-                                    hourly_in_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[+] Person #{t} Crossed IN (coming near). Hourly IN: {hourly_in_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                        # Check for crossing detection
+                        if t not in counted_tracks:
+                            y_start = track_start_y[t]
+                            y_diff = cy - y_start
+                            
+                            # Coming near to camera (IN): Y increases (moves downwards in frame)
+                            if y_diff >= 0.15:
+                                hourly_in_count += 1
+                                counted_tracks.add(t)
+                                print(f"[+] Person #{t} moved near (IN). Net vertical movement: {y_diff:.2f}")
+                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
-                                # Going far from camera (OUT): Y decreases past 0.55
-                                elif prev_cy >= 0.55 and cy < 0.55:
-                                    hourly_out_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[-] Person #{t} Crossed OUT (going far). Hourly OUT: {hourly_out_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
-                                    
+                            # Going far from camera (OUT): Y decreases (moves upwards in frame)
+                            elif y_diff <= -0.15:
+                                hourly_out_count += 1
+                                counted_tracks.add(t)
+                                print(f"[-] Person #{t} moved far (OUT). Net vertical movement: {y_diff:.2f}")
+                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
-                    track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
+                    track_start_y = {tid: y_val for tid, y_val in track_start_y.items() if tid in active_track_ids}
+                    track_history = {tid: pts for tid, pts in track_history.items() if tid in active_track_ids}
                     
                 # Periodic database sync (every 10 seconds)
                 if current_time_secs - last_db_write_time > 10.0:
@@ -992,12 +1013,15 @@ def start_area_count_demo():
                     )
                 else:
                     if len(areas) == 0:
-                        # Draw Virtual Horizontal Crossing Line
-                        h_img, w_img = frame.image.shape[:2]
-                        y_line = int(0.55 * h_img)
-                        cv2.line(frame.image, (0, y_line), (w_img, y_line), (255, 255, 0), 2)
-                        cv2.putText(frame.image, "VIRTUAL CROSSING LINE", (20, y_line - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        # Draw tracking dots and trails (lines) for all active tracks
+                        for t_id, pts in track_history.items():
+                            if len(pts) > 1:
+                                # Draw trail as a magenta line
+                                for i in range(1, len(pts)):
+                                    cv2.line(frame.image, pts[i-1], pts[i], (255, 0, 255), 2)
+                            if len(pts) > 0:
+                                # Draw a yellow dot at the current location
+                                cv2.circle(frame.image, pts[-1], 5, (0, 255, 255), -1)
                         
                         # Labels on top left
                         annotator.set_label(
