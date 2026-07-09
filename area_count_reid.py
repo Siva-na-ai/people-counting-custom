@@ -898,18 +898,39 @@ def start_area_count_demo():
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                 else:
-                    # Non-zones mode: track unique people seen as IN count
-                    new_person_detected = False
+                    # Non-zones mode: track unique people crossing a virtual horizontal line at Y = 0.55
                     for idx, (box, _, _, t) in enumerate(detections):
-                        if t not in seen_track_ids:
-                            seen_track_ids.add(t)
-                            hourly_in_count += 1
-                            new_person_detected = True
-                            print(f"[+] New Person #{t} detected. Total unique people (IN): {hourly_in_count}")
-                    
-                    if new_person_detected:
-                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                        cx = float((box[0] + box[2]) / 2.0)
+                        cy = float((box[1] + box[3]) / 2.0)
+                        current_center = [cx, cy]
+                        
+                        prev_center = track_last_center.get(t)
+                        track_last_center[t] = current_center
+                        
+                        if prev_center is not None:
+                            prev_cy = prev_center[1]
+                            last_trig = track_last_trigger.get(t, 0.0)
+                            if current_time_secs - last_trig >= 5.0:
+                                # Coming near to camera (IN): Y increases past 0.55
+                                if prev_cy <= 0.55 and cy > 0.55:
+                                    hourly_in_count += 1
+                                    track_last_trigger[t] = current_time_secs
+                                    print(f"[+] Person #{t} Crossed IN (coming near). Hourly IN: {hourly_in_count}")
+                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                
+                                # Going far from camera (OUT): Y decreases past 0.55
+                                elif prev_cy >= 0.55 and cy < 0.55:
+                                    hourly_out_count += 1
+                                    track_last_trigger[t] = current_time_secs
+                                    print(f"[-] Person #{t} Crossed OUT (going far). Hourly OUT: {hourly_out_count}")
+                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                    
+                    # Clean up tracked histories for aged-out tracks to prevent memory leak
+                    active_track_ids = {track.track_id for track in tracker.tracks}
+                    track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
+                    track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                     
                 # Periodic database sync (every 10 seconds)
                 if current_time_secs - last_db_write_time > 10.0:
@@ -971,15 +992,34 @@ def start_area_count_demo():
                     )
                 else:
                     if len(areas) == 0:
-                        #-----Count and show all people-----
-                        total_people = len(detections)
-                        label = f"Total People Count: {total_people}"
+                        # Draw Virtual Horizontal Crossing Line
+                        h_img, w_img = frame.image.shape[:2]
+                        y_line = int(0.55 * h_img)
+                        cv2.line(frame.image, (0, y_line), (w_img, y_line), (255, 255, 0), 2)
+                        cv2.putText(frame.image, "VIRTUAL CROSSING LINE", (20, y_line - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                        
+                        # Labels on top left
                         annotator.set_label(
                             image=frame.image,
                             x=20,
-                            y=40,
-                            color=(0, 255, 255),
-                            label=label,
+                            y=30,
+                            color=(0, 255, 0),
+                            label=f"Hourly IN: {hourly_in_count}",
+                        )
+                        annotator.set_label(
+                            image=frame.image,
+                            x=20,
+                            y=55,
+                            color=(0, 0, 255),
+                            label=f"Hourly OUT: {hourly_out_count}",
+                        )
+                        annotator.set_label(
+                            image=frame.image,
+                            x=20,
+                            y=80,
+                            color=(255, 255, 255),
+                            label=f"Occupancy: {current_occupancy}",
                         )
                     else:
                         for ID, area in enumerate(areas):
