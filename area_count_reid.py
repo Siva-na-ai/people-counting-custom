@@ -820,10 +820,10 @@ def start_area_count_demo():
     track_last_trigger = {}
     # track_id -> list of recent center points (absolute coordinates for drawing)
     track_history = {}
-    # track_id -> starting cy coordinate (normalized)
-    track_start_y = {}
-    # set of track_ids that have been counted in the current session
-    counted_tracks = set()
+    # track_id -> starting cx coordinate (normalized)
+    track_start_x = {}
+    # track_id -> "IN" or "OUT" (representing how they were counted)
+    counted_tracks = {}
     
     current_time = datetime.now()
     current_hour = current_time.hour
@@ -867,7 +867,7 @@ def start_area_count_demo():
                     track_last_center.clear()
                     track_last_trigger.clear()
                     track_history.clear()
-                    track_start_y.clear()
+                    track_start_x.clear()
                     counted_tracks.clear()
                 
                 if using_zones and line_in and line_out:
@@ -904,15 +904,15 @@ def start_area_count_demo():
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                 else:
-                    # Non-zones mode: track movement direction based on starting position and draw trails
+                    # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT)
                     for idx, (box, _, _, t) in enumerate(detections):
                         cx = float((box[0] + box[2]) / 2.0)
                         cy = float((box[1] + box[3]) / 2.0)
                         current_center = [cx, cy]
                         
-                        # Store starting Y coordinate
-                        if t not in track_start_y:
-                            track_start_y[t] = cy
+                        # Store starting X coordinate
+                        if t not in track_start_x:
+                            track_start_x[t] = cx
                             
                         # Store history for trail drawing (absolute coordinates)
                         h_img, w_img = frame.image.shape[:2]
@@ -928,29 +928,29 @@ def start_area_count_demo():
                         
                         # Check for crossing detection
                         if t not in counted_tracks:
-                            y_start = track_start_y[t]
-                            y_diff = cy - y_start
+                            x_start = track_start_x[t]
+                            x_diff = cx - x_start
                             
-                            # Coming near to camera (IN): Y increases (moves downwards in frame)
-                            if y_diff >= 0.15:
+                            # Coming near to camera (IN): X decreases (moves right to left)
+                            if x_diff <= -0.15:
                                 hourly_in_count += 1
-                                counted_tracks.add(t)
-                                print(f"[+] Person #{t} moved near (IN). Net vertical movement: {y_diff:.2f}")
+                                counted_tracks[t] = "IN"
+                                print(f"[+] Person #{t} moved near (IN). Net horizontal movement: {x_diff:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
-                            # Going far from camera (OUT): Y decreases (moves upwards in frame)
-                            elif y_diff <= -0.15:
+                            # Going far from camera (OUT): X increases (moves left to right)
+                            elif x_diff >= 0.15:
                                 hourly_out_count += 1
-                                counted_tracks.add(t)
-                                print(f"[-] Person #{t} moved far (OUT). Net vertical movement: {y_diff:.2f}")
+                                counted_tracks[t] = "OUT"
+                                print(f"[-] Person #{t} moved far (OUT). Net horizontal movement: {x_diff:.2f}")
                                 avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
-                    track_start_y = {tid: y_val for tid, y_val in track_start_y.items() if tid in active_track_ids}
+                    track_start_x = {tid: x_val for tid, x_val in track_start_x.items() if tid in active_track_ids}
                     track_history = {tid: pts for tid, pts in track_history.items() if tid in active_track_ids}
                     
                 # Periodic database sync (every 10 seconds)
@@ -1015,13 +1015,25 @@ def start_area_count_demo():
                     if len(areas) == 0:
                         # Draw tracking dots and trails (lines) for all active tracks
                         for t_id, pts in track_history.items():
+                            # Determine color based on counted status
+                            status = counted_tracks.get(t_id)
+                            if status == "IN":
+                                color_trail = (0, 255, 0)  # Green
+                                color_dot = (0, 255, 0)
+                            elif status == "OUT":
+                                color_trail = (0, 0, 255)  # Red
+                                color_dot = (0, 0, 255)
+                            else:
+                                color_trail = (255, 0, 255) # Magenta
+                                color_dot = (0, 255, 255)   # Yellow
+                                
                             if len(pts) > 1:
-                                # Draw trail as a magenta line
+                                # Draw trail
                                 for i in range(1, len(pts)):
-                                    cv2.line(frame.image, pts[i-1], pts[i], (255, 0, 255), 2)
+                                    cv2.line(frame.image, pts[i-1], pts[i], color_trail, 2)
                             if len(pts) > 0:
-                                # Draw a yellow dot at the current location
-                                cv2.circle(frame.image, pts[-1], 5, (0, 255, 255), -1)
+                                # Draw a dot at the current location
+                                cv2.circle(frame.image, pts[-1], 5, color_dot, -1)
                         
                         # Labels on top left
                         annotator.set_label(
