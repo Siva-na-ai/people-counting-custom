@@ -223,86 +223,91 @@ def get_db_connection():
 
 def db_worker():
     while True:
-        item = db_queue.get()
-        if item is None:
-            break
-        task_type, data = item
-        if task_type == "save_lines":
-            camera_id, line_in, line_out = data
-            conn = get_db_connection()
-            if conn is not None:
-                try:
-                    with conn.cursor() as cur:
-                        # Upsert IN Line
-                        cur.execute(
-                            "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_in'",
-                            (camera_id,)
-                        )
-                        row_in = cur.fetchone()
-                        if row_in:
+        try:
+            item = db_queue.get()
+            if item is None:
+                db_queue.task_done()
+                break
+            task_type, data = item
+            if task_type == "save_lines":
+                camera_id, line_in, line_out = data
+                conn = get_db_connection()
+                if conn is not None:
+                    try:
+                        with conn.cursor() as cur:
+                            # Upsert IN Line
                             cur.execute(
-                                "UPDATE public.zones SET points = %s WHERE zone_id = %s",
-                                (json.dumps(line_in), row_in[0])
+                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_in'",
+                                (camera_id,)
                             )
-                        else:
+                            row_in = cur.fetchone()
+                            if row_in:
+                                cur.execute(
+                                    "UPDATE public.zones SET points = %s WHERE zone_id = %s",
+                                    (json.dumps(line_in), row_in[0])
+                                )
+                            else:
+                                cur.execute(
+                                    "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
+                                    (camera_id, f"Camera {camera_id} IN Line", "Interactive IN Line", "line_in", json.dumps(line_in))
+                                )
+                            
+                            # Upsert OUT Line
                             cur.execute(
-                                "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
-                                (camera_id, f"Camera {camera_id} IN Line", "Interactive IN Line", "line_in", json.dumps(line_in))
+                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_out'",
+                                (camera_id,)
                             )
+                            row_out = cur.fetchone()
+                            if row_out:
+                                cur.execute(
+                                    "UPDATE public.zones SET points = %s WHERE zone_id = %s",
+                                    (json.dumps(line_out), row_out[0])
+                                )
+                            else:
+                                cur.execute(
+                                    "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
+                                    (camera_id, f"Camera {camera_id} OUT Line", "Interactive OUT Line", "line_out", json.dumps(line_out))
+                                )
+                            conn.commit()
+                            print(f"[+] Saved crossing lines for camera {camera_id} to database.")
+                    except Exception as e:
+                        print(f"[-] Failed to save lines to database: {e}")
+                    finally:
+                        conn.close()
                         
-                        # Upsert OUT Line
-                        cur.execute(
-                            "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_out'",
-                            (camera_id,)
-                        )
-                        row_out = cur.fetchone()
-                        if row_out:
+            elif task_type == "update_hourly":
+                camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ = data
+                conn = get_db_connection()
+                if conn is not None:
+                    try:
+                        with conn.cursor() as cur:
                             cur.execute(
-                                "UPDATE public.zones SET points = %s WHERE zone_id = %s",
-                                (json.dumps(line_out), row_out[0])
+                                "SELECT id FROM public.people_count_hourly WHERE camera_id = %s AND report_date = %s AND report_hour = %s",
+                                (camera_id, report_date, report_hour)
                             )
-                        else:
-                            cur.execute(
-                                "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
-                                (camera_id, f"Camera {camera_id} OUT Line", "Interactive OUT Line", "line_out", json.dumps(line_out))
-                            )
-                        conn.commit()
-                        print(f"[+] Saved crossing lines for camera {camera_id} to database.")
-                except Exception as e:
-                    print(f"[-] Failed to save lines to database: {e}")
-                finally:
-                    conn.close()
-                    
-        elif task_type == "update_hourly":
-            camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ = data
-            conn = get_db_connection()
-            if conn is not None:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT id FROM public.people_count_hourly WHERE camera_id = %s AND report_date = %s AND report_hour = %s",
-                            (camera_id, report_date, report_hour)
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            cur.execute(
-                                """UPDATE public.people_count_hourly 
-                                   SET total_in = %s, total_out = %s, peak_occupancy = %s, avg_occupancy = %s, created_at = NOW() 
-                                   WHERE id = %s""",
-                                (total_in, total_out, peak_occ, avg_occ, row[0])
-                            )
-                        else:
-                            cur.execute(
-                                """INSERT INTO public.people_count_hourly (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, avg_occupancy, created_at) 
-                                   VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
-                                (camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ)
-                            )
-                        conn.commit()
-                except Exception as e:
-                    print(f"[-] Database hourly count update failed: {e}")
-                finally:
-                    conn.close()
-        db_queue.task_done()
+                            row = cur.fetchone()
+                            if row:
+                                cur.execute(
+                                    """UPDATE public.people_count_hourly 
+                                       SET total_in = %s, total_out = %s, peak_occupancy = %s, avg_occupancy = %s, created_at = NOW() 
+                                       WHERE id = %s""",
+                                    (total_in, total_out, peak_occ, avg_occ, row[0])
+                                )
+                            else:
+                                cur.execute(
+                                    """INSERT INTO public.people_count_hourly (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, avg_occupancy, created_at) 
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())""",
+                                    (camera_id, report_date, report_hour, total_in, total_out, peak_occ, avg_occ)
+                                )
+                            conn.commit()
+                            print(f"[+] Successfully saved hourly count to DB: camera_id={camera_id}, IN={total_in}, OUT={total_out}, peak={peak_occ}, avg={avg_occ}")
+                    except Exception as e:
+                        print(f"[-] Database hourly count update failed: {e}")
+                    finally:
+                        conn.close()
+            db_queue.task_done()
+        except Exception as queue_err:
+            print(f"[-] Exception in db_worker loop: {queue_err}")
 
 def load_lines_from_db(camera_id):
     conn = get_db_connection()
@@ -894,11 +899,17 @@ def start_area_count_demo():
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                 else:
                     # Non-zones mode: track unique people seen as IN count
+                    new_person_detected = False
                     for idx, (box, _, _, t) in enumerate(detections):
                         if t not in seen_track_ids:
                             seen_track_ids.add(t)
                             hourly_in_count += 1
+                            new_person_detected = True
                             print(f"[+] New Person #{t} detected. Total unique people (IN): {hourly_in_count}")
+                    
+                    if new_person_detected:
+                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                     
                 # Periodic database sync (every 10 seconds)
                 if current_time_secs - last_db_write_time > 10.0:
