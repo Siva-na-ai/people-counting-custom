@@ -813,6 +813,8 @@ def start_area_count_demo():
     track_last_center = {}
     # track_id -> timestamp of last transition trigger
     track_last_trigger = {}
+    # Keep track of unique track IDs seen in the current hour/session (used when not using zones)
+    seen_track_ids = set()
     
     current_time = datetime.now()
     current_hour = current_time.hour
@@ -855,6 +857,7 @@ def start_area_count_demo():
                     occupancy_records = [current_occupancy]
                     track_last_center.clear()
                     track_last_trigger.clear()
+                    seen_track_ids.clear()
                 
                 if using_zones and line_in and line_out:
                     for idx, (box, _, _, t) in enumerate(detections):
@@ -889,6 +892,13 @@ def start_area_count_demo():
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
+                else:
+                    # Non-zones mode: track unique people seen as IN count
+                    for idx, (box, _, _, t) in enumerate(detections):
+                        if t not in seen_track_ids:
+                            seen_track_ids.add(t)
+                            hourly_in_count += 1
+                            print(f"[+] New Person #{t} detected. Total unique people (IN): {hourly_in_count}")
                     
                 # Periodic database sync (every 10 seconds)
                 if current_time_secs - last_db_write_time > 10.0:
