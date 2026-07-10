@@ -502,7 +502,8 @@ def main():
     def patched_deploy(model_obj, camera_id=None, *args, **kwargs):
         if camera_id is None:
             camera_id = ""
-        return original_deploy(model_obj, camera_id=camera_id, *args, **kwargs)
+        device.camera_id = camera_id
+        return original_deploy(model_obj, *args, **kwargs)
     device.deploy = patched_deploy
     
     device.camera_id = ""
