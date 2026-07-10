@@ -884,12 +884,12 @@ def get_args():
         default=0.58,
         help="Similarity threshold for ReID matching (default: 0.58)"
     )
-    # Add configurable maximum track age to prevent early embedding removal
+    # Add configurable maximum track age to prevent early embedding removal (default: 24 hours at 30 FPS)
     parser.add_argument(
         "--max-age",
         type=int,
-        default=86400,
-        help="Maximum frames to keep an inactive track in memory (default: 86400)"
+        default=2592000,
+        help="Maximum frames to keep an inactive track in memory (default: 2592000)"
     )
     return parser.parse_args()
 
