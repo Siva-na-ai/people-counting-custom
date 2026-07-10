@@ -877,6 +877,20 @@ def get_args():
         action="store_true",
         help="Use a single gate line for counting (IN/OUT based on direction)"
     )
+    # Add configurable ReID similarity threshold
+    parser.add_argument(
+        "--reid-threshold",
+        type=float,
+        default=0.58,
+        help="Similarity threshold for ReID matching (default: 0.58)"
+    )
+    # Add configurable maximum track age to prevent early embedding removal
+    parser.add_argument(
+        "--max-age",
+        type=int,
+        default=86400,
+        help="Maximum frames to keep an inactive track in memory (default: 86400)"
+    )
     return parser.parse_args()
 
     
@@ -971,8 +985,13 @@ def start_area_count_demo():
         for area in json_areas: 
             areas.append(Area(area["points"]))
 
-    # Initialize BoTSORT Tracker (combining tracking and ReID)
-    tracker = BoTSORTTracker(reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900)
+    # Initialize BoTSORT Tracker (combining tracking and ReID) with user-configurable parameters to prevent early embedding removal
+    tracker = BoTSORTTracker(
+        reid_model_name='osnet_x1_0',
+        reid_threshold=args.reid_threshold,
+        device='cpu',
+        max_age=args.max_age
+    )
     
     annotator = Annotator(
         color=ColorPalette.default(), thickness=1, text_thickness=1, text_scale=0.4
