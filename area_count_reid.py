@@ -812,6 +812,8 @@ def start_area_count_demo():
     track_start_y = {}
     # track_id -> "IN" or "OUT" (representing how they were counted)
     counted_tracks = {}
+    # track_id -> side where they were first detected ("inside" or "outside")
+    track_start_side = {}
     
     current_time = datetime.now()
     current_hour = current_time.hour
@@ -859,6 +861,7 @@ def start_area_count_demo():
                     track_start_x.clear()
                     track_start_y.clear()
                     counted_tracks.clear()
+                    track_start_side.clear()
                 
                 if using_zones and gate_line:
                     for idx, (box, _, _, t) in enumerate(detections):
@@ -866,6 +869,15 @@ def start_area_count_demo():
                         cx = float((box[0] + box[2]) / 2.0)
                         cy = float((box[1] + box[3]) / 2.0)
                         current_center = [cx, cy]
+                        
+                        if t not in track_start_side:
+                            pts = sorted(gate_line, key=lambda p: (p[0], p[1]))
+                            A = pts[0]
+                            B = pts[1]
+                            dx = B[0] - A[0]
+                            dy = B[1] - A[1]
+                            start_score = (cx - A[0]) * (-dy) + (cy - A[1]) * dx
+                            track_start_side[t] = "inside" if start_score > 0 else "outside"
                         
                         prev_center = track_last_center.get(t)
                         track_last_center[t] = current_center
@@ -885,25 +897,32 @@ def start_area_count_demo():
                                     prev_score = (prev_center[0] - A[0]) * (-dy) + (prev_center[1] - A[1]) * dx
                                     curr_score = (current_center[0] - A[0]) * (-dy) + (current_center[1] - A[1]) * dx
                                     
+                                    start_side = track_start_side.get(t)
+                                    
                                     if prev_score < 0 and curr_score > 0:
                                         # Outside to Inside -> IN
-                                        hourly_in_count += 1
-                                        track_last_trigger[t] = current_time_secs
-                                        print(f"[+] Person #{t} Crossed Gate Line (IN). Hourly IN: {hourly_in_count}")
-                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                        if start_side == "outside":
+                                            hourly_in_count += 1
+                                            track_last_trigger[t] = current_time_secs
+                                            track_start_side[t] = "inside"
+                                            print(f"[+] Person #{t} Crossed Gate Line (IN). Hourly IN: {hourly_in_count}")
+                                            avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                            db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                     elif prev_score > 0 and curr_score < 0:
                                         # Inside to Outside -> OUT
-                                        hourly_out_count += 1
-                                        track_last_trigger[t] = current_time_secs
-                                        print(f"[-] Person #{t} Crossed Gate Line (OUT). Hourly OUT: {hourly_out_count}")
-                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                        if start_side == "inside":
+                                            hourly_out_count += 1
+                                            track_last_trigger[t] = current_time_secs
+                                            track_start_side[t] = "outside"
+                                            print(f"[-] Person #{t} Crossed Gate Line (OUT). Hourly OUT: {hourly_out_count}")
+                                            avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                            db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
+                    track_start_side = {tid: s_val for tid, s_val in track_start_side.items() if tid in active_track_ids}
                 else:
                     # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT) and vertically (top to bottom is IN, bottom to top is OUT)
                     for idx, (box, _, _, t) in enumerate(detections):
