@@ -229,49 +229,32 @@ def db_worker():
                 db_queue.task_done()
                 break
             task_type, data = item
-            if task_type == "save_lines":
-                camera_id, line_in, line_out = data
+            if task_type == "save_gate_line":
+                camera_id, gate_line = data
                 conn = get_db_connection()
                 if conn is not None:
                     try:
                         with conn.cursor() as cur:
-                            # Upsert IN Line
+                            # Upsert Gate Line
                             cur.execute(
-                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_in'",
+                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'gate_line'",
                                 (camera_id,)
                             )
-                            row_in = cur.fetchone()
-                            if row_in:
+                            row = cur.fetchone()
+                            if row:
                                 cur.execute(
                                     "UPDATE public.zones SET points = %s WHERE zone_id = %s",
-                                    (json.dumps(line_in), row_in[0])
+                                    (json.dumps(gate_line), row[0])
                                 )
                             else:
                                 cur.execute(
                                     "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
-                                    (camera_id, f"Camera {camera_id} IN Line", "Interactive IN Line", "line_in", json.dumps(line_in))
-                                )
-                            
-                            # Upsert OUT Line
-                            cur.execute(
-                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'line_out'",
-                                (camera_id,)
-                            )
-                            row_out = cur.fetchone()
-                            if row_out:
-                                cur.execute(
-                                    "UPDATE public.zones SET points = %s WHERE zone_id = %s",
-                                    (json.dumps(line_out), row_out[0])
-                                )
-                            else:
-                                cur.execute(
-                                    "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
-                                    (camera_id, f"Camera {camera_id} OUT Line", "Interactive OUT Line", "line_out", json.dumps(line_out))
+                                    (camera_id, f"Camera {camera_id} Gate Line", "Interactive Gate Line", "gate_line", json.dumps(gate_line))
                                 )
                             conn.commit()
-                            print(f"[+] Saved crossing lines for camera {camera_id} to database.")
+                            print(f"[+] Saved gate line for camera {camera_id} to database.")
                     except Exception as e:
-                        print(f"[-] Failed to save lines to database: {e}")
+                        print(f"[-] Failed to save gate line to database: {e}")
                     finally:
                         conn.close()
                         
@@ -309,36 +292,45 @@ def db_worker():
         except Exception as queue_err:
             print(f"[-] Exception in db_worker loop: {queue_err}")
 
-def load_lines_from_db(camera_id):
+def load_gate_line_from_db(camera_id):
     conn = get_db_connection()
     if conn is None:
-        return None, None
-    line_in, line_out = None, None
+        return None
+    gate_line = None
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT zone_type, points FROM public.zones WHERE camera_id = %s AND zone_type IN ('line_in', 'line_out')",
+                "SELECT zone_type, points FROM public.zones WHERE camera_id = %s AND zone_type = 'gate_line'",
                 (camera_id,)
             )
-            rows = cur.fetchall()
-            for row in rows:
-                zone_type, points_data = row
+            row = cur.fetchone()
+            if row:
+                points_data = row[1]
                 if isinstance(points_data, str):
-                    pts = json.loads(points_data)
+                    gate_line = json.loads(points_data)
                 else:
-                    pts = points_data
-                if zone_type == "line_in":
-                    line_in = pts
-                elif zone_type == "line_out":
-                    line_out = pts
+                    gate_line = points_data
+            else:
+                # Fallback: if 'gate_line' is not found, try loading 'line_in' as fallback
+                cur.execute(
+                    "SELECT points FROM public.zones WHERE camera_id = %s AND zone_type = 'line_in'",
+                    (camera_id,)
+                )
+                row_fallback = cur.fetchone()
+                if row_fallback:
+                    points_data = row_fallback[0]
+                    if isinstance(points_data, str):
+                        gate_line = json.loads(points_data)
+                    else:
+                        gate_line = points_data
     except Exception as e:
-        print(f"[-] Failed to load lines from database: {e}")
+        print(f"[-] Failed to load gate line from database: {e}")
     finally:
         conn.close()
-    return line_in, line_out
+    return gate_line
 
-def draw_lines_interactively(device):
-    print("[*] Opening camera stream to capture a frame for line definition...")
+def draw_line_interactively(device):
+    print("[*] Opening camera stream to capture a frame for gate line definition...")
     frame_image = None
     with device as stream:
         for frame in stream:
@@ -348,10 +340,8 @@ def draw_lines_interactively(device):
     if frame_image is None:
         raise Exception("Failed to capture frame from camera for drawing lines.")
         
-    line_in = []
-    line_out = []
+    gate_line = []
     current_points = []
-    phase = "IN"  # "IN" or "OUT"
     
     def mouse_callback(event, x, y, flags, param):
         nonlocal current_points
@@ -361,11 +351,11 @@ def draw_lines_interactively(device):
             h, w = frame_image.shape[:2]
             current_points.append([float(x / w), float(y / h)])
             
-    window_name = "Define Lines - Click twice to draw. Enter to confirm. Q to Quit"
+    window_name = "Define Gate Line - Click twice to draw. Enter to confirm. Q to Quit"
     cv2.namedWindow(window_name)
     cv2.setMouseCallback(window_name, mouse_callback)
     
-    print(f"[*] Define {phase} Line: Click two points on the image. Press ENTER or 'n' when finished.")
+    print("[*] Define Gate Line: Click two points on the image. Press ENTER when finished.")
     
     while True:
         temp_img = frame_image.copy()
@@ -373,20 +363,14 @@ def draw_lines_interactively(device):
         
         # Draw current points and line
         if len(current_points) > 0:
-            cv2.circle(temp_img, (int(current_points[0][0]*w), int(current_points[0][1]*h)), 5, (0, 255, 0) if phase == "IN" else (0, 0, 255), -1)
+            cv2.circle(temp_img, (int(current_points[0][0]*w), int(current_points[0][1]*h)), 5, (0, 255, 255), -1)
         if len(current_points) == 2:
-            cv2.circle(temp_img, (int(current_points[1][0]*w), int(current_points[1][1]*h)), 5, (0, 255, 0) if phase == "IN" else (0, 0, 255), -1)
+            cv2.circle(temp_img, (int(current_points[1][0]*w), int(current_points[1][1]*h)), 5, (0, 255, 255), -1)
             cv2.line(temp_img, (int(current_points[0][0]*w), int(current_points[0][1]*h)),
-                     (int(current_points[1][0]*w), int(current_points[1][1]*h)), (0, 255, 0) if phase == "IN" else (0, 0, 255), 2)
-            
-        # Draw completed IN line if defining OUT line
-        if phase == "OUT" and len(line_in) == 2:
-            pt1 = (int(line_in[0][0]*w), int(line_in[0][1]*h))
-            pt2 = (int(line_in[1][0]*w), int(line_in[1][1]*h))
-            cv2.line(temp_img, pt1, pt2, (0, 255, 255), 2)
+                     (int(current_points[1][0]*w), int(current_points[1][1]*h)), (0, 255, 255), 2)
             
         # Overlay instruction text
-        cv2.putText(temp_img, f"Define {phase} Line: Click twice. Press ENTER to confirm.", (10, 30),
+        cv2.putText(temp_img, "Define Gate Line: Click twice. Press ENTER to confirm.", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         cv2.imshow(window_name, temp_img)
@@ -394,21 +378,15 @@ def draw_lines_interactively(device):
         
         if key == 13 or key == ord('n'):  # Enter or 'n' key
             if len(current_points) == 2:
-                if phase == "IN":
-                    line_in = current_points.copy()
-                    current_points = []
-                    phase = "OUT"
-                    print("[*] Define OUT Line: Click two points on the image. Press ENTER when finished.")
-                elif phase == "OUT":
-                    line_out = current_points.copy()
-                    break
+                gate_line = current_points.copy()
+                break
             else:
-                print(f"[-] Please click exactly two points to define the {phase} line.")
+                print("[-] Please click exactly two points to define the gate line.")
         elif key == ord('q'):
             break
             
     cv2.destroyWindow(window_name)
-    return line_in, line_out
+    return gate_line
 
 def ccw(A, B, C):
     return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
@@ -770,8 +748,7 @@ def start_area_count_demo():
     device.deploy(model)
 
     areas = []
-    line_in = None
-    line_out = None
+    gate_line = None
     
     # Start the DB worker thread
     db_thread = threading.Thread(target=db_worker, daemon=True)
@@ -783,23 +760,23 @@ def start_area_count_demo():
     if using_zones:
         if not args.redraw:
             # Try loading from DB
-            line_in, line_out = load_lines_from_db(camera_id)
-            if line_in and line_out:
-                print(f"[*] Loaded existing IN and OUT lines for camera {camera_id} from DB.")
+            gate_line = load_gate_line_from_db(camera_id)
+            if gate_line:
+                print(f"[*] Loaded existing Gate Line for camera {camera_id} from DB.")
         
-        if not line_in or not line_out:
-            # Must draw them
+        if not gate_line:
+            # Must draw it
             try:
-                line_in, line_out = draw_lines_interactively(device)
-                if line_in and line_out and len(line_in) == 2 and len(line_out) == 2:
+                gate_line = draw_line_interactively(device)
+                if gate_line and len(gate_line) == 2:
                     # Save to DB
-                    db_queue.put(("save_lines", (camera_id, line_in, line_out)))
+                    db_queue.put(("save_gate_line", (camera_id, gate_line)))
                 else:
-                    print("[-] Lines creation cancelled or failed. Exiting.")
+                    print("[-] Gate Line creation cancelled or failed. Exiting.")
                     db_queue.put(None)
                     return
             except Exception as e:
-                print(f"[-] Error defining lines interactively: {e}")
+                print(f"[-] Error defining Gate Line interactively: {e}")
                 print("[-] Please run in a GUI environment or provide pre-defined zones/lines.")
                 db_queue.put(None)
                 return
@@ -883,7 +860,7 @@ def start_area_count_demo():
                     track_start_y.clear()
                     counted_tracks.clear()
                 
-                if using_zones and line_in and line_out:
+                if using_zones and gate_line:
                     for idx, (box, _, _, t) in enumerate(detections):
                         # Center of bbox
                         cx = float((box[0] + box[2]) / 2.0)
@@ -896,21 +873,32 @@ def start_area_count_demo():
                         if prev_center is not None:
                             last_trig = track_last_trigger.get(t, 0.0)
                             if current_time_secs - last_trig >= 5.0:
-                                # Check if path crossed the IN line (Green)
-                                if intersect(line_in[0], line_in[1], prev_center, current_center):
-                                    hourly_in_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[+] Person #{t} Crossed IN Line. Hourly IN: {hourly_in_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
-                                
-                                # Check if path crossed the OUT line (Red)
-                                elif intersect(line_out[0], line_out[1], prev_center, current_center):
-                                    hourly_out_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[-] Person #{t} Crossed OUT Line. Hourly OUT: {hourly_out_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                # Check if path crossed the gate line
+                                if intersect(gate_line[0], gate_line[1], prev_center, current_center):
+                                    pts = sorted(gate_line, key=lambda p: (p[0], p[1]))
+                                    A = pts[0]
+                                    B = pts[1]
+                                    
+                                    dx = B[0] - A[0]
+                                    dy = B[1] - A[1]
+                                    
+                                    prev_score = (prev_center[0] - A[0]) * (-dy) + (prev_center[1] - A[1]) * dx
+                                    curr_score = (current_center[0] - A[0]) * (-dy) + (current_center[1] - A[1]) * dx
+                                    
+                                    if prev_score < 0 and curr_score > 0:
+                                        # Outside to Inside -> IN
+                                        hourly_in_count += 1
+                                        track_last_trigger[t] = current_time_secs
+                                        print(f"[+] Person #{t} Crossed Gate Line (IN). Hourly IN: {hourly_in_count}")
+                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                    elif prev_score > 0 and curr_score < 0:
+                                        # Inside to Outside -> OUT
+                                        hourly_out_count += 1
+                                        track_last_trigger[t] = current_time_secs
+                                        print(f"[-] Person #{t} Crossed Gate Line (OUT). Hourly OUT: {hourly_out_count}")
+                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
                     active_track_ids = {track.track_id for track in tracker.tracks}
@@ -1033,22 +1021,15 @@ def start_area_count_demo():
                     alpha=0.2,
                 )
                 
-                if using_zones and line_in and line_out:
+                if using_zones and gate_line:
                     h_img, w_img = frame.image.shape[:2]
                     
-                    # Draw IN line (Green)
-                    pt_in1 = (int(line_in[0][0] * w_img), int(line_in[0][1] * h_img))
-                    pt_in2 = (int(line_in[1][0] * w_img), int(line_in[1][1] * h_img))
-                    cv2.line(frame.image, pt_in1, pt_in2, (0, 255, 0), 3)
-                    cv2.putText(frame.image, "IN LINE", (pt_in1[0] + 10, pt_in1[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    # Draw OUT line (Red)
-                    pt_out1 = (int(line_out[0][0] * w_img), int(line_out[0][1] * h_img))
-                    pt_out2 = (int(line_out[1][0] * w_img), int(line_out[1][1] * h_img))
-                    cv2.line(frame.image, pt_out1, pt_out2, (0, 0, 255), 3)
-                    cv2.putText(frame.image, "OUT LINE", (pt_out1[0] + 10, pt_out1[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    # Draw Gate Line
+                    pt1 = (int(gate_line[0][0] * w_img), int(gate_line[0][1] * h_img))
+                    pt2 = (int(gate_line[1][0] * w_img), int(gate_line[1][1] * h_img))
+                    cv2.line(frame.image, pt1, pt2, (0, 255, 255), 3)
+                    cv2.putText(frame.image, "GATE LINE", (pt1[0] + 10, pt1[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     
                     # Labels on top left
                     annotator.set_label(
