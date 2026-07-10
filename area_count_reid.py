@@ -229,7 +229,36 @@ def db_worker():
                 db_queue.task_done()
                 break
             task_type, data = item
-            if task_type == "save_lines":
+            if task_type == "save_gate_line":
+                camera_id, gate_line = data
+                conn = get_db_connection()
+                if conn is not None:
+                    try:
+                        with conn.cursor() as cur:
+                            # Upsert Gate Line
+                            cur.execute(
+                                "SELECT zone_id FROM public.zones WHERE camera_id = %s AND zone_type = 'gate_line'",
+                                (camera_id,)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                cur.execute(
+                                    "UPDATE public.zones SET points = %s WHERE zone_id = %s",
+                                    (json.dumps(gate_line), row[0])
+                                )
+                            else:
+                                cur.execute(
+                                    "INSERT INTO public.zones (camera_id, zone_name, description, zone_type, points) VALUES (%s, %s, %s, %s, %s)",
+                                    (camera_id, f"Camera {camera_id} Gate Line", "Interactive Gate Line", "gate_line", json.dumps(gate_line))
+                                )
+                            conn.commit()
+                            print(f"[+] Saved gate line for camera {camera_id} to database.")
+                    except Exception as e:
+                        print(f"[-] Failed to save gate line to database: {e}")
+                    finally:
+                        conn.close()
+                        
+            elif task_type == "save_double_lines":
                 camera_id, line_in, line_out = data
                 conn = get_db_connection()
                 if conn is not None:
@@ -269,9 +298,9 @@ def db_worker():
                                     (camera_id, f"Camera {camera_id} OUT Line", "Interactive OUT Line", "line_out", json.dumps(line_out))
                                 )
                             conn.commit()
-                            print(f"[+] Saved crossing lines for camera {camera_id} to database.")
+                            print(f"[+] Saved double crossing lines for camera {camera_id} to database.")
                     except Exception as e:
-                        print(f"[-] Failed to save lines to database: {e}")
+                        print(f"[-] Failed to save double lines to database: {e}")
                     finally:
                         conn.close()
                         
@@ -309,7 +338,103 @@ def db_worker():
         except Exception as queue_err:
             print(f"[-] Exception in db_worker loop: {queue_err}")
 
-def load_lines_from_db(camera_id):
+def load_gate_line_from_db(camera_id):
+    conn = get_db_connection()
+    if conn is None:
+        return None
+    gate_line = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT zone_type, points FROM public.zones WHERE camera_id = %s AND zone_type = 'gate_line'",
+                (camera_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                points_data = row[1]
+                if isinstance(points_data, str):
+                    gate_line = json.loads(points_data)
+                else:
+                    gate_line = points_data
+            else:
+                # Fallback: if 'gate_line' is not found, try loading 'line_in' as fallback
+                cur.execute(
+                    "SELECT points FROM public.zones WHERE camera_id = %s AND zone_type = 'line_in'",
+                    (camera_id,)
+                )
+                row_fallback = cur.fetchone()
+                if row_fallback:
+                    points_data = row_fallback[0]
+                    if isinstance(points_data, str):
+                        gate_line = json.loads(points_data)
+                    else:
+                        gate_line = points_data
+    except Exception as e:
+        print(f"[-] Failed to load gate line from database: {e}")
+    finally:
+        conn.close()
+    return gate_line
+
+def draw_line_interactively(device):
+    print("[*] Opening camera stream to capture a frame for gate line definition...")
+    frame_image = None
+    with device as stream:
+        for frame in stream:
+            frame_image = frame.image.copy()
+            break
+            
+    if frame_image is None:
+        raise Exception("Failed to capture frame from camera for drawing lines.")
+        
+    gate_line = []
+    current_points = []
+    
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal current_points
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if len(current_points) >= 2:
+                current_points = []
+            h, w = frame_image.shape[:2]
+            current_points.append([float(x / w), float(y / h)])
+            
+    window_name = "Define Gate Line - Click twice to draw. Enter to confirm. Q to Quit"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    print("[*] Define Gate Line: Click two points on the image. Press ENTER when finished.")
+    
+    while True:
+        temp_img = frame_image.copy()
+        h, w = temp_img.shape[:2]
+        
+        # Draw current points and line
+        if len(current_points) > 0:
+            cv2.circle(temp_img, (int(current_points[0][0]*w), int(current_points[0][1]*h)), 5, (0, 255, 255), -1)
+        if len(current_points) == 2:
+            cv2.circle(temp_img, (int(current_points[1][0]*w), int(current_points[1][1]*h)), 5, (0, 255, 255), -1)
+            cv2.line(temp_img, (int(current_points[0][0]*w), int(current_points[0][1]*h)),
+                     (int(current_points[1][0]*w), int(current_points[1][1]*h)), (0, 255, 255), 2)
+            
+        # Overlay instruction text
+        cv2.putText(temp_img, "Define Gate Line: Click twice. Press ENTER to confirm.", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        cv2.imshow(window_name, temp_img)
+        key = cv2.waitKey(30) & 0xFF
+        
+        if key == 13 or key == ord('n'):  # Enter or 'n' key
+            if len(current_points) == 2:
+                gate_line = current_points.copy()
+                break
+            else:
+                print("[-] Please click exactly two points to define the gate line.")
+        elif key == ord('q'):
+            break
+            
+    cv2.destroyWindow(window_name)
+    return gate_line
+
+def load_double_lines_from_db(camera_id):
     conn = get_db_connection()
     if conn is None:
         return None, None
@@ -323,21 +448,18 @@ def load_lines_from_db(camera_id):
             rows = cur.fetchall()
             for row in rows:
                 zone_type, points_data = row
-                if isinstance(points_data, str):
-                    pts = json.loads(points_data)
-                else:
-                    pts = points_data
+                pts = json.loads(points_data) if isinstance(points_data, str) else points_data
                 if zone_type == "line_in":
                     line_in = pts
                 elif zone_type == "line_out":
                     line_out = pts
     except Exception as e:
-        print(f"[-] Failed to load lines from database: {e}")
+        print(f"[-] Failed to load double lines from database: {e}")
     finally:
         conn.close()
     return line_in, line_out
 
-def draw_lines_interactively(device):
+def draw_double_lines_interactively(device):
     print("[*] Opening camera stream to capture a frame for line definition...")
     frame_image = None
     with device as stream:
@@ -351,7 +473,7 @@ def draw_lines_interactively(device):
     line_in = []
     line_out = []
     current_points = []
-    phase = "IN"  # "IN" or "OUT"
+    phase = "IN"
     
     def mouse_callback(event, x, y, flags, param):
         nonlocal current_points
@@ -750,6 +872,11 @@ def get_args():
         default=1,
         help="Camera identifier for database records"
     )
+    parser.add_argument(
+        "--single-line",
+        action="store_true",
+        help="Use a single gate line for counting (IN/OUT based on direction)"
+    )
     return parser.parse_args()
 
     
@@ -766,10 +893,21 @@ def start_area_count_demo():
 
     model = NanoDetPlus416x416()
     device = AiCamera()
+    
+    # Monkey-patch device.deploy to prevent a bug in modlib where start() redeploys with camera_id=None
+    original_deploy = device.deploy
+    def patched_deploy(model_obj, camera_id=None, *args, **kwargs):
+        if camera_id is None:
+            camera_id = ""
+        device.camera_id = camera_id
+        return original_deploy(model_obj, *args, **kwargs)
+    device.deploy = patched_deploy
+    
     device.camera_id = ""
     device.deploy(model)
 
     areas = []
+    gate_line = None
     line_in = None
     line_out = None
     
@@ -779,30 +917,55 @@ def start_area_count_demo():
 
     camera_id = args.camera_id
     using_zones = args.zones
+    single_line_mode = args.single_line
     
     if using_zones:
-        if not args.redraw:
-            # Try loading from DB
-            line_in, line_out = load_lines_from_db(camera_id)
-            if line_in and line_out:
-                print(f"[*] Loaded existing IN and OUT lines for camera {camera_id} from DB.")
-        
-        if not line_in or not line_out:
-            # Must draw them
-            try:
-                line_in, line_out = draw_lines_interactively(device)
-                if line_in and line_out and len(line_in) == 2 and len(line_out) == 2:
-                    # Save to DB
-                    db_queue.put(("save_lines", (camera_id, line_in, line_out)))
-                else:
-                    print("[-] Lines creation cancelled or failed. Exiting.")
+        if single_line_mode:
+            if not args.redraw:
+                # Try loading from DB
+                gate_line = load_gate_line_from_db(camera_id)
+                if gate_line:
+                    print(f"[*] Loaded existing Gate Line for camera {camera_id} from DB.")
+            
+            if not gate_line:
+                # Must draw it
+                try:
+                    gate_line = draw_line_interactively(device)
+                    if gate_line and len(gate_line) == 2:
+                        # Save to DB
+                        db_queue.put(("save_gate_line", (camera_id, gate_line)))
+                    else:
+                        print("[-] Gate Line creation cancelled or failed. Exiting.")
+                        db_queue.put(None)
+                        return
+                except Exception as e:
+                    print(f"[-] Error defining Gate Line interactively: {e}")
+                    print("[-] Please run in a GUI environment or provide pre-defined zones/lines.")
                     db_queue.put(None)
                     return
-            except Exception as e:
-                print(f"[-] Error defining lines interactively: {e}")
-                print("[-] Please run in a GUI environment or provide pre-defined zones/lines.")
-                db_queue.put(None)
-                return
+        else:
+            if not args.redraw:
+                # Try loading from DB
+                line_in, line_out = load_double_lines_from_db(camera_id)
+                if line_in and line_out:
+                    print(f"[*] Loaded existing IN and OUT lines for camera {camera_id} from DB.")
+            
+            if not line_in or not line_out:
+                # Must draw them
+                try:
+                    line_in, line_out = draw_double_lines_interactively(device)
+                    if line_in and line_out and len(line_in) == 2 and len(line_out) == 2:
+                        # Save to DB
+                        db_queue.put(("save_double_lines", (camera_id, line_in, line_out)))
+                    else:
+                        print("[-] Lines creation cancelled or failed. Exiting.")
+                        db_queue.put(None)
+                        return
+                except Exception as e:
+                    print(f"[-] Error defining lines interactively: {e}")
+                    print("[-] Please run in a GUI environment or provide pre-defined zones/lines.")
+                    db_queue.put(None)
+                    return
     elif args.json_file is not None:
         json_areas = json_regions_extraction(args.json_file)
         for area in json_areas: 
@@ -835,6 +998,8 @@ def start_area_count_demo():
     track_start_y = {}
     # track_id -> "IN" or "OUT" (representing how they were counted)
     counted_tracks = {}
+    # track_id -> side where they were first detected ("inside" or "outside")
+    track_start_side = {}
     
     current_time = datetime.now()
     current_hour = current_time.hour
@@ -882,40 +1047,94 @@ def start_area_count_demo():
                     track_start_x.clear()
                     track_start_y.clear()
                     counted_tracks.clear()
+                    track_start_side.clear()
                 
-                if using_zones and line_in and line_out:
-                    for idx, (box, _, _, t) in enumerate(detections):
-                        # Center of bbox
-                        cx = float((box[0] + box[2]) / 2.0)
-                        cy = float((box[1] + box[3]) / 2.0)
-                        current_center = [cx, cy]
-                        
-                        prev_center = track_last_center.get(t)
-                        track_last_center[t] = current_center
-                        
-                        if prev_center is not None:
-                            last_trig = track_last_trigger.get(t, 0.0)
-                            if current_time_secs - last_trig >= 5.0:
-                                # Check if path crossed the IN line (Green)
-                                if intersect(line_in[0], line_in[1], prev_center, current_center):
-                                    hourly_in_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[+] Person #{t} Crossed IN Line. Hourly IN: {hourly_in_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
-                                
-                                # Check if path crossed the OUT line (Red)
-                                elif intersect(line_out[0], line_out[1], prev_center, current_center):
-                                    hourly_out_count += 1
-                                    track_last_trigger[t] = current_time_secs
-                                    print(f"[-] Person #{t} Crossed OUT Line. Hourly OUT: {hourly_out_count}")
-                                    avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
-                                    db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
-                                
+                if using_zones:
+                    if single_line_mode and gate_line:
+                        for idx, (box, _, _, t) in enumerate(detections):
+                            # Center of bbox
+                            cx = float((box[0] + box[2]) / 2.0)
+                            cy = float((box[1] + box[3]) / 2.0)
+                            current_center = [cx, cy]
+                            
+                            if t not in track_start_side:
+                                pts = sorted(gate_line, key=lambda p: (p[0], p[1]))
+                                A = pts[0]
+                                B = pts[1]
+                                dx = B[0] - A[0]
+                                dy = B[1] - A[1]
+                                start_score = (cx - A[0]) * (-dy) + (cy - A[1]) * dx
+                                track_start_side[t] = "inside" if start_score > 0 else "outside"
+                            
+                            prev_center = track_last_center.get(t)
+                            track_last_center[t] = current_center
+                            
+                            if prev_center is not None:
+                                last_trig = track_last_trigger.get(t, 0.0)
+                                if current_time_secs - last_trig >= 5.0:
+                                    # Check if path crossed the gate line
+                                    if intersect(gate_line[0], gate_line[1], prev_center, current_center):
+                                        pts = sorted(gate_line, key=lambda p: (p[0], p[1]))
+                                        A = pts[0]
+                                        B = pts[1]
+                                        
+                                        dx = B[0] - A[0]
+                                        dy = B[1] - A[1]
+                                        
+                                        prev_score = (prev_center[0] - A[0]) * (-dy) + (prev_center[1] - A[1]) * dx
+                                        curr_score = (current_center[0] - A[0]) * (-dy) + (current_center[1] - A[1]) * dx
+                                        
+                                        start_side = track_start_side.get(t)
+                                        
+                                        if prev_score < 0 and curr_score > 0:
+                                            # Outside to Inside -> IN
+                                            if start_side == "outside":
+                                                hourly_in_count += 1
+                                                track_last_trigger[t] = current_time_secs
+                                                track_start_side[t] = "inside"
+                                                print(f"[+] Person #{t} Crossed Gate Line (IN). Hourly IN: {hourly_in_count}")
+                                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                        elif prev_score > 0 and curr_score < 0:
+                                            # Inside to Outside -> OUT
+                                            if start_side == "inside":
+                                                hourly_out_count += 1
+                                                track_last_trigger[t] = current_time_secs
+                                                track_start_side[t] = "outside"
+                                                print(f"[-] Person #{t} Crossed Gate Line (OUT). Hourly OUT: {hourly_out_count}")
+                                                avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                                db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                    
+                    elif not single_line_mode and line_in and line_out:
+                        for idx, (box, _, _, t) in enumerate(detections):
+                            cx = float((box[0] + box[2]) / 2.0)
+                            cy = float((box[1] + box[3]) / 2.0)
+                            current_center = [cx, cy]
+                            
+                            prev_center = track_last_center.get(t)
+                            track_last_center[t] = current_center
+                            
+                            if prev_center is not None:
+                                last_trig = track_last_trigger.get(t, 0.0)
+                                if current_time_secs - last_trig >= 5.0:
+                                    if intersect(line_in[0], line_in[1], prev_center, current_center):
+                                        hourly_in_count += 1
+                                        track_last_trigger[t] = current_time_secs
+                                        print(f"[+] Person #{t} Crossed IN Line. Hourly IN: {hourly_in_count}")
+                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                    elif intersect(line_out[0], line_out[1], prev_center, current_center):
+                                        hourly_out_count += 1
+                                        track_last_trigger[t] = current_time_secs
+                                        print(f"[-] Person #{t} Crossed OUT Line. Hourly OUT: {hourly_out_count}")
+                                        avg_occ = round(sum(occupancy_records) / len(occupancy_records), 2) if occupancy_records else 0.0
+                                        db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
+                                        
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
                     active_track_ids = {track.track_id for track in tracker.tracks}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
+                    track_start_side = {tid: s_val for tid, s_val in track_start_side.items() if tid in active_track_ids}
                 else:
                     # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT) and vertically (top to bottom is IN, bottom to top is OUT)
                     for idx, (box, _, _, t) in enumerate(detections):
@@ -1033,22 +1252,29 @@ def start_area_count_demo():
                     alpha=0.2,
                 )
                 
-                if using_zones and line_in and line_out:
+                if using_zones:
                     h_img, w_img = frame.image.shape[:2]
-                    
-                    # Draw IN line (Green)
-                    pt_in1 = (int(line_in[0][0] * w_img), int(line_in[0][1] * h_img))
-                    pt_in2 = (int(line_in[1][0] * w_img), int(line_in[1][1] * h_img))
-                    cv2.line(frame.image, pt_in1, pt_in2, (0, 255, 0), 3)
-                    cv2.putText(frame.image, "IN LINE", (pt_in1[0] + 10, pt_in1[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    # Draw OUT line (Red)
-                    pt_out1 = (int(line_out[0][0] * w_img), int(line_out[0][1] * h_img))
-                    pt_out2 = (int(line_out[1][0] * w_img), int(line_out[1][1] * h_img))
-                    cv2.line(frame.image, pt_out1, pt_out2, (0, 0, 255), 3)
-                    cv2.putText(frame.image, "OUT LINE", (pt_out1[0] + 10, pt_out1[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    if single_line_mode and gate_line:
+                        # Draw Gate Line
+                        pt1 = (int(gate_line[0][0] * w_img), int(gate_line[0][1] * h_img))
+                        pt2 = (int(gate_line[1][0] * w_img), int(gate_line[1][1] * h_img))
+                        cv2.line(frame.image, pt1, pt2, (0, 255, 255), 3)
+                        cv2.putText(frame.image, "GATE LINE", (pt1[0] + 10, pt1[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    elif not single_line_mode and line_in and line_out:
+                        # Draw IN line (Green)
+                        pt_in1 = (int(line_in[0][0] * w_img), int(line_in[0][1] * h_img))
+                        pt_in2 = (int(line_in[1][0] * w_img), int(line_in[1][1] * h_img))
+                        cv2.line(frame.image, pt_in1, pt_in2, (0, 255, 0), 3)
+                        cv2.putText(frame.image, "IN LINE", (pt_in1[0] + 10, pt_in1[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        
+                        # Draw OUT line (Red)
+                        pt_out1 = (int(line_out[0][0] * w_img), int(line_out[0][1] * h_img))
+                        pt_out2 = (int(line_out[1][0] * w_img), int(line_out[1][1] * h_img))
+                        cv2.line(frame.image, pt_out1, pt_out2, (0, 0, 255), 3)
+                        cv2.putText(frame.image, "OUT LINE", (pt_out1[0] + 10, pt_out1[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                     
                     # Labels on top left
                     annotator.set_label(
