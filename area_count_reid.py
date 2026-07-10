@@ -893,6 +893,15 @@ def start_area_count_demo():
 
     model = NanoDetPlus416x416()
     device = AiCamera()
+    
+    # Monkey-patch device.deploy to prevent a bug in modlib where start() redeploys with camera_id=None
+    original_deploy = device.deploy
+    def patched_deploy(model_obj, camera_id=None, *args, **kwargs):
+        if camera_id is None:
+            camera_id = ""
+        return original_deploy(model_obj, camera_id=camera_id, *args, **kwargs)
+    device.deploy = patched_deploy
+    
     device.camera_id = ""
     device.deploy(model)
 
