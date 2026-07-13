@@ -14,8 +14,8 @@
 # limitations under the License.
 #
 
+import os
 import cv2
-import torch
 import numpy as np
 import subprocess
 import argparse
@@ -27,19 +27,117 @@ from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
 from scipy.optimize import linear_sum_assignment
 
 try:
-    import torchreid
-    try:
-        from torchreid.utils import FeatureExtractor
-    except ImportError:
-        # Fallback for nested package structure in some PyPI versions of torchreid
-        from torchreid.reid.utils import FeatureExtractor
-except ImportError as e:
-    import traceback
-    traceback.print_exc()
-    raise ImportError(
-        f"Please install torch and torchreid to run this script. (Original error: {e}). "
-        "Run: pip install torch torchvision torchreid"
-    )
+    import hailo_platform as hpf
+except ImportError:
+    hpf = None
+
+class HailoReID:
+    """
+    Class managing ReID inference on Hailo-8L using a compiled HEF model.
+    """
+    def __init__(self, hef_path: str):
+        self.hef_path = os.path.expanduser(hef_path)
+        if not os.path.exists(self.hef_path):
+            raise FileNotFoundError(f"Hailo ReID HEF model not found at {self.hef_path}")
+            
+        if hpf is None:
+            raise ImportError(
+                "hailo_platform is not installed. Please install HailoRT Python bindings to run this script."
+            )
+            
+        self.hef = hpf.HEF(self.hef_path)
+        self.target = hpf.VDevice()
+        
+        # Configure network group
+        self.configure_params = hpf.ConfigureParams.create_from_hef(
+            self.hef, interface=hpf.HailoStreamInterface.PCIe
+        )
+        self.network_group = self.target.configure(self.hef, self.configure_params)[0]
+        self.network_group_params = self.network_group.create_params()
+        
+        # Stream info
+        self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
+        self.output_vstream_info = self.hef.get_output_vstream_infos()[0]
+        
+        # Configure vstream parameters
+        self.input_vstreams_params = hpf.InputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
+        )
+        self.output_vstreams_params = hpf.OutputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
+        )
+        
+        # Activate network group
+        self.activated_network_group = self.network_group.activate(self.network_group_params)
+        self.activated_network_group.__enter__()
+        
+        # Create virtual streams
+        self.infer_pipeline = hpf.InferVStreams(
+            self.network_group, self.input_vstreams_params, self.output_vstreams_params
+        )
+        self.infer_pipeline.__enter__()
+        
+        # Determine shape
+        shape = self.input_vstream_info.shape
+        if len(shape) == 4:
+            self.batch, self.height, self.width, self.channels = shape
+        else:
+            self.height, self.width, self.channels = shape
+            self.batch = 1
+            
+        self.input_name = self.input_vstream_info.name
+        self.output_name = self.output_vstream_info.name
+
+    def infer(self, crop_bgr: np.ndarray) -> np.ndarray:
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None
+            
+        try:
+            # Convert BGR to RGB
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            # Resize to expected shape (self.width, self.height)
+            crop_resized = cv2.resize(crop_rgb, (self.width, self.height))
+            # Add batch dimension and convert to float32
+            input_data = {
+                self.input_name: np.expand_dims(crop_resized, axis=0).astype(np.float32)
+            }
+            
+            # Run inference
+            results = self.infer_pipeline.infer(input_data)
+            embedding = results[self.output_name][0].flatten()
+            
+            # L2 normalization for cosine similarity
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+                
+            return embedding
+        except Exception as e:
+            print(f"[-] HailoReID inference exception: {e}")
+            return None
+
+    def close(self):
+        if hasattr(self, 'infer_pipeline') and self.infer_pipeline:
+            try:
+                self.infer_pipeline.__exit__(None, None, None)
+            except Exception:
+                pass
+            self.infer_pipeline = None
+        if hasattr(self, 'activated_network_group') and self.activated_network_group:
+            try:
+                self.activated_network_group.__exit__(None, None, None)
+            except Exception:
+                pass
+            self.activated_network_group = None
+        if hasattr(self, 'target') and self.target:
+            try:
+                self.target.close()
+            except Exception:
+                pass
+            self.target = None
+
+    def __del__(self):
+        self.close()
 
 # Helper function to compute IoU
 def compute_iou(box1, box2):
@@ -190,30 +288,57 @@ class HTTPStreamer:
 
 
 class Track:
-    def __init__(self, track_id, box, embedding, score, class_id):
+    def __init__(self, track_id: int, box: np.ndarray, embedding: np.ndarray, score: float, class_id: int):
         self.track_id = track_id
         self.box = box
         self.score = score
         self.class_id = class_id
         self.embeddings = [embedding] if embedding is not None else []
+        self.quality_scores = [1.0] if embedding is not None else []
         self.time_since_update = 0
+        self.update_count = 0
+        self.history = [] # list of (cx, cy) center points
+
+    def add_embedding(self, embedding: np.ndarray, quality_score: float):
+        if embedding is None:
+            return
+        if len(self.embeddings) < 5:
+            self.embeddings.append(embedding)
+            self.quality_scores.append(quality_score)
+        else:
+            # Replace the lowest quality embedding if the new one is better
+            min_idx = np.argmin(self.quality_scores)
+            if quality_score > self.quality_scores[min_idx]:
+                self.embeddings[min_idx] = embedding
+                self.quality_scores[min_idx] = quality_score
 
 class BoTSORTTracker:
-    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900):
+    def __init__(self, reid_model_path: str = '~/models/repvgg_a0_person_reid_512.hef', reid_threshold: float = 0.70, max_age: int = 900, w_iou: float = 0.4, w_app: float = 0.4, w_motion: float = 0.2):
         self.max_age = max_age
         self.reid_threshold = reid_threshold
+        self.w_iou = w_iou
+        self.w_app = w_app
+        self.w_motion = w_motion
+        self.gating_threshold = 0.70
         
-        # Initialize ReID FeatureExtractor
-        self.extractor = FeatureExtractor(
-            model_name=reid_model_name,
-            device=device
-        )
+        # Initialize ReID engine
+        self.reid = HailoReID(hef_path=reid_model_path)
         self.tracks = []
         self.next_track_id = 1
         
-    def get_crop(self, image, box):
+        # Persistent global gallery: person_id -> {best_embedding, embeddings, quality_scores, last_seen, hit_count}
+        self.global_gallery = {}
+        
+    def close(self):
+        if hasattr(self, 'reid') and self.reid:
+            self.reid.close()
+            
+    def __del__(self):
+        self.close()
+        
+    def get_crop(self, image: np.ndarray, box: np.ndarray) -> np.ndarray:
         """
-        Extract and preprocess the crop from the image.
+        Extract the crop from the image as BGR (OpenCV default).
         """
         h, w, _ = image.shape
         if any(coord > 2.0 for coord in box):
@@ -232,53 +357,78 @@ class BoTSORTTracker:
         if xmax <= xmin or ymax <= ymin:
             return None
             
-        crop = image[ymin:ymax, xmin:xmax]
-        # Convert BGR (OpenCV default) to RGB (Torchreid expects RGB)
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        return crop_rgb
+        return image[ymin:ymax, xmin:xmax]
 
-    def extract_embedding(self, crop):
+    def extract_embedding(self, crop: np.ndarray) -> np.ndarray:
         """
         Extract 512-dim embedding from a crop.
         """
-        with torch.no_grad():
-            features = self.extractor([crop])
-            embedding = features[0].cpu().numpy()
-            # L2 normalization for cosine similarity
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-            return embedding
+        if crop is None or crop.size == 0:
+            return None
+        return self.reid.infer(crop)
 
-    def update(self, frame_image, detections):
+    def _get_crop_quality(self, crop: np.ndarray, confidence: float) -> tuple[bool, float]:
+        if crop is None or crop.size == 0:
+            return False, 0.0
+        h, w, _ = crop.shape
+        # Reject tiny detections
+        if w < 32 or h < 64:
+            return False, 0.0
+        # Reject low-confidence detections
+        if confidence < 0.65:
+            return False, 0.0
+            
+        # Reject blurred crops using Laplacian variance
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        except Exception:
+            return False, 0.0
+            
+        if lap_var < 100.0:
+            return False, 0.0
+            
+        quality_score = float(confidence * lap_var)
+        return True, quality_score
+
+    def _update_gallery(self, person_id: int, embedding: np.ndarray, quality_score: float):
+        if person_id not in self.global_gallery:
+            self.global_gallery[person_id] = {
+                'best_embedding': None,
+                'embeddings': [],
+                'quality_scores': [],
+                'last_seen': datetime.now(),
+                'hit_count': 0
+            }
+            
+        entry = self.global_gallery[person_id]
+        entry['last_seen'] = datetime.now()
+        entry['hit_count'] += 1
+        
+        if embedding is not None:
+            if len(entry['embeddings']) < 5:
+                entry['embeddings'].append(embedding)
+                entry['quality_scores'].append(quality_score)
+            else:
+                min_idx = np.argmin(entry['quality_scores'])
+                if quality_score > entry['quality_scores'][min_idx]:
+                    entry['embeddings'][min_idx] = embedding
+                    entry['quality_scores'][min_idx] = quality_score
+                    
+            # Recalculate best_embedding
+            max_idx = np.argmax(entry['quality_scores'])
+            entry['best_embedding'] = entry['embeddings'][max_idx]
+
+    def update(self, frame_image: np.ndarray, detections) -> np.ndarray:
         try:
             return self._update_impl(frame_image, detections)
         except Exception as e:
             print("DEBUG: Exception in BoTSORTTracker.update:", type(e), str(e))
-            print("DEBUG: detections type:", type(detections))
-            try:
-                print("DEBUG: detections dir:", dir(detections))
-                if len(detections) > 0:
-                    item = detections[0]
-                    print("DEBUG: item type:", type(item))
-                    print("DEBUG: item dir:", dir(item))
-                    if hasattr(detections, 'coords'):
-                        print("DEBUG: coords:", detections.coords)
-                    else:
-                        print("DEBUG: item tuple:", tuple(item))
-            except Exception as e2:
-                print("DEBUG: Failed to inspect detections:", str(e2))
             raise e
 
-    def _update_impl(self, frame_image, detections):
-        """
-        detections: Detections object or NumPy structured array.
-        Returns:
-            Detections object or NumPy structured array with updated track IDs.
-        """
+    def _update_impl(self, frame_image: np.ndarray, detections) -> np.ndarray:
         num_dets = len(detections)
         
-        # Desired structured output dtype (only used if fallback to numpy array is active)
         descr = [('box', '<f4', (4,)), ('confidence', '<f4'), ('class_id', '<i4'), ('track_id', '<i4')]
         new_dtype = np.dtype(descr)
         
@@ -294,7 +444,6 @@ class BoTSORTTracker:
         scores = []
         class_ids = []
         
-        # Extract fields
         is_numpy = isinstance(detections, np.ndarray)
         
         if not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
@@ -318,142 +467,235 @@ class BoTSORTTracker:
                 scores.append(det_tuple[1])
                 class_ids.append(det_tuple[2])
                 
-        active_tracks = self.tracks
-        num_tracks = len(active_tracks)
+        # 1. Pre-extract embeddings and calculate crop quality metrics
+        det_embeddings = []
+        det_qualities = []
         
-        matched_track_indices = []
+        for d_idx in range(num_dets):
+            det_box = boxes[d_idx]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            crop = self.get_crop(frame_image, det_box)
+            
+            emb = self.extract_embedding(crop)
+            is_valid, quality = self._get_crop_quality(crop, float(scores[d_idx]))
+            
+            det_embeddings.append(emb)
+            det_qualities.append((is_valid, quality))
+            
+        num_tracks = len(self.tracks)
+        matched_tracks = []
         matched_det_indices = []
         
-        # Stage 1: IoU / Motion Matching (only for tracks that were active in the previous frame)
-        iou_tracks = [t for t in active_tracks if t.time_since_update == 0]
-        num_iou_tracks = len(iou_tracks)
+        final_mapped_ids = [0] * num_dets
         
-        if num_iou_tracks > 0 and num_dets > 0:
-            iou_matrix = np.zeros((num_iou_tracks, num_dets))
-            for t_idx, track in enumerate(iou_tracks):
+        # 2. Hungarian matching on active and recently lost tracks
+        if num_tracks > 0:
+            cost_matrix = np.zeros((num_tracks, num_dets))
+            
+            for t_idx, track in enumerate(self.tracks):
+                # Predict current position using velocity model
+                if len(track.history) >= 2:
+                    c_last = track.history[-1]
+                    c_prev = track.history[-2]
+                    v_x = c_last[0] - c_prev[0]
+                    v_y = c_last[1] - c_prev[1]
+                    pred_cx = c_last[0] + v_x * (track.time_since_update + 1)
+                    pred_cy = c_last[1] + v_y * (track.time_since_update + 1)
+                elif len(track.history) == 1:
+                    pred_cx, pred_cy = track.history[0]
+                else:
+                    pred_cx = (track.box[0] + track.box[2]) / 2.0
+                    pred_cy = (track.box[1] + track.box[3]) / 2.0
+                    
+                track_w = track.box[2] - track.box[0]
+                track_h = track.box[3] - track.box[1]
+                diag = np.sqrt(track_w**2 + track_h**2)
+                
                 for d_idx in range(num_dets):
                     det_box = boxes[d_idx]
                     if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
                         det_box = det_box.flatten()
-                    iou_matrix[t_idx, d_idx] = compute_iou(track.box, det_box)
-            
-            cost_matrix = 1.0 - iou_matrix
+                        
+                    # IoU Cost
+                    C_iou = float(1.0 - compute_iou(track.box, det_box))
+                    
+                    # Motion Cost
+                    det_cx = (det_box[0] + det_box[2]) / 2.0
+                    det_cy = (det_box[1] + det_box[3]) / 2.0
+                    dist = np.sqrt((det_cx - pred_cx)**2 + (det_cy - pred_cy)**2)
+                    dist_norm = dist / diag if diag > 0 else dist
+                    C_motion = float(1.0 - np.exp(-2.0 * dist_norm))
+                    
+                    # Appearance Cost
+                    det_emb = det_embeddings[d_idx]
+                    if len(track.embeddings) > 0 and det_emb is not None:
+                        sims = [np.dot(det_emb, stored_emb) for stored_emb in track.embeddings]
+                        max_sim = max(sims) if sims else 0.0
+                        C_app = float(1.0 - max_sim)
+                        has_app = True
+                    else:
+                        C_app = 1.0
+                        has_app = False
+                        
+                    if track.time_since_update <= 3:
+                        # Frame-to-frame matching combining IoU, Appearance, and Motion
+                        if has_app:
+                            cost = self.w_iou * C_iou + self.w_app * C_app + self.w_motion * C_motion
+                        else:
+                            total_w = self.w_iou + self.w_motion
+                            if total_w > 0:
+                                cost = (self.w_iou / total_w) * C_iou + (self.w_motion / total_w) * C_motion
+                            else:
+                                cost = C_iou
+                    else:
+                        # Long-lost track matching (ReID-only)
+                        if has_app:
+                            cost = C_app
+                            if max_sim < self.reid_threshold:
+                                cost = 1e5
+                        else:
+                            cost = 1e5
+                            
+                    if track.time_since_update <= 3 and cost > self.gating_threshold:
+                        cost = 1e5
+                        
+                    cost_matrix[t_idx, d_idx] = cost
+                    
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             
             for r, c in zip(row_ind, col_ind):
-                if iou_matrix[r, c] >= 0.50:
-                    matched_track_indices.append(r)
+                if cost_matrix[r, c] < 1e4:
+                    track = self.tracks[r]
+                    matched_tracks.append(track)
                     matched_det_indices.append(c)
+                    final_mapped_ids[c] = track.track_id
                     
-        # Map stage 1 matches back to the original active_tracks
-        matched_tracks = [iou_tracks[r] for r in matched_track_indices]
-        matched_det_indices = list(matched_det_indices)
-        
-        # Stage 2: ReID / Appearance Matching for remaining unmatched tracks/detections
-        unmatched_tracks = [t for t in active_tracks if t not in matched_tracks]
-        unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
-        
-        if len(unmatched_tracks) > 0 and len(unmatched_det_indices) > 0:
-            det_embeddings = []
-            valid_det_indices = []
-            
-            for d_idx in unmatched_det_indices:
-                det_box = boxes[d_idx]
-                if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
-                    det_box = det_box.flatten()
-                crop = self.get_crop(frame_image, det_box)
-                if crop is not None:
-                    emb = self.extract_embedding(crop)
-                    det_embeddings.append(emb)
-                    valid_det_indices.append(d_idx)
-                    
-            if len(det_embeddings) > 0 and any(len(t.embeddings) > 0 for t in unmatched_tracks):
-                reid_cost_matrix = np.ones((len(unmatched_tracks), len(det_embeddings)))
-                
-                for i, track in enumerate(unmatched_tracks):
-                    if len(track.embeddings) == 0:
-                        continue
-                    for j, det_emb in enumerate(det_embeddings):
-                        sims = [np.dot(det_emb, stored_emb) for stored_emb in track.embeddings]
-                        max_sim = max(sims) if sims else 0.0
-                        reid_cost_matrix[i, j] = 1.0 - max_sim
-                
-                r_ind, c_ind = linear_sum_assignment(reid_cost_matrix)
-                
-                for r, c in zip(r_ind, c_ind):
-                    max_sim = 1.0 - reid_cost_matrix[r, c]
-                    if max_sim >= self.reid_threshold:
-                        track = unmatched_tracks[r]
-                        d_idx = valid_det_indices[c]
-                        
-                        matched_tracks.append(track)
-                        matched_det_indices.append(d_idx)
-                        track.embeddings.append(det_embeddings[c])
-                        if len(track.embeddings) > 10:
-                            track.embeddings.pop(0)
-                            
-        # Stage 3: Update matched track states
-        final_matched_tracks = []
-        final_matched_det_indices = []
-        matched_pairs = sorted(zip(matched_tracks, matched_det_indices), key=lambda x: x[1])
-        
-        for track, d_idx in matched_pairs:
+        # Update matched tracks
+        for track, d_idx in zip(matched_tracks, matched_det_indices):
             det_box = boxes[d_idx]
             if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
                 det_box = det_box.flatten()
-            det_score = scores[d_idx]
-            if isinstance(det_score, np.ndarray):
-                det_score = float(det_score.item())
-            det_class = class_ids[d_idx]
-            if isinstance(det_class, np.ndarray):
-                det_class = int(det_class.item())
+            det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
+            det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
             
             track.box = det_box
             track.score = det_score
             track.class_id = det_class
             track.time_since_update = 0
             
-            final_matched_tracks.append(track)
-            final_matched_det_indices.append(d_idx)
+            cx = (det_box[0] + det_box[2]) / 2.0
+            cy = (det_box[1] + det_box[3]) / 2.0
+            track.history.append((cx, cy))
+            if len(track.history) > 10:
+                track.history.pop(0)
+                
+            det_emb = det_embeddings[d_idx]
+            is_valid, quality = det_qualities[d_idx]
+            if is_valid and det_emb is not None:
+                track.add_embedding(det_emb, quality)
+                self._update_gallery(track.track_id, det_emb, quality)
+            else:
+                self._update_gallery(track.track_id, None, 0.0)
+                
+            track.update_count += 1
             
-        # Stage 4: Create new tracks for unmatched detections
-        all_unmatched_det_indices = [d for d in range(num_dets) if d not in final_matched_det_indices]
-        for d_idx in all_unmatched_det_indices:
+        # 3. Re-identify remaining unmatched detections via Global ReID Gallery
+        unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
+        valid_unmatched_det_indices = [d for d in unmatched_det_indices if det_embeddings[d] is not None]
+        
+        active_ids = {t.track_id for t in matched_tracks}
+        inactive_gallery_ids = [pid for pid in self.global_gallery.keys() if pid not in active_ids]
+        
+        if len(valid_unmatched_det_indices) > 0 and len(inactive_gallery_ids) > 0:
+            gallery_cost = np.ones((len(inactive_gallery_ids), len(valid_unmatched_det_indices)))
+            
+            for i, pid in enumerate(inactive_gallery_ids):
+                entry = self.global_gallery[pid]
+                for j, d_idx in enumerate(valid_unmatched_det_indices):
+                    det_emb = det_embeddings[d_idx]
+                    sims = [np.dot(det_emb, stored_emb) for stored_emb in entry['embeddings']]
+                    max_sim = max(sims) if sims else 0.0
+                    if max_sim >= self.reid_threshold:
+                        gallery_cost[i, j] = float(1.0 - max_sim)
+                    else:
+                        gallery_cost[i, j] = 1e5
+                        
+            r_ind, c_ind = linear_sum_assignment(gallery_cost)
+            
+            for r, c in zip(r_ind, c_ind):
+                if gallery_cost[r, c] < 1e4:
+                    pid = inactive_gallery_ids[r]
+                    d_idx = valid_unmatched_det_indices[c]
+                    
+                    det_box = boxes[d_idx]
+                    if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                        det_box = det_box.flatten()
+                    det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
+                    det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
+                    det_emb = det_embeddings[d_idx]
+                    is_valid, quality = det_qualities[d_idx]
+                    
+                    new_track = Track(pid, det_box, None, det_score, det_class)
+                    entry = self.global_gallery[pid]
+                    new_track.embeddings = list(entry['embeddings'])
+                    new_track.quality_scores = list(entry['quality_scores'])
+                    
+                    cx = (det_box[0] + det_box[2]) / 2.0
+                    cy = (det_box[1] + det_box[3]) / 2.0
+                    new_track.history.append((cx, cy))
+                    
+                    if is_valid and det_emb is not None:
+                        new_track.add_embedding(det_emb, quality)
+                        self._update_gallery(pid, det_emb, quality)
+                    else:
+                        self._update_gallery(pid, None, 0.0)
+                        
+                    self.tracks.append(new_track)
+                    matched_tracks.append(new_track)
+                    final_mapped_ids[d_idx] = pid
+                    unmatched_det_indices.remove(d_idx)
+                    
+        # 4. Create new tracks for the remaining unmatched detections
+        for d_idx in unmatched_det_indices:
             det_box = boxes[d_idx]
             if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
                 det_box = det_box.flatten()
-            det_score = scores[d_idx]
-            if isinstance(det_score, np.ndarray):
-                det_score = float(det_score.item())
-            det_class = class_ids[d_idx]
-            if isinstance(det_class, np.ndarray):
-                det_class = int(det_class.item())
+            det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
+            det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
+            det_emb = det_embeddings[d_idx]
+            is_valid, quality = det_qualities[d_idx]
             
-            crop = self.get_crop(frame_image, det_box)
-            emb = self.extract_embedding(crop) if crop is not None else None
+            new_track = Track(self.next_track_id, det_box, None, det_score, det_class)
+            cx = (det_box[0] + det_box[2]) / 2.0
+            cy = (det_box[1] + det_box[3]) / 2.0
+            new_track.history.append((cx, cy))
             
-            new_track = Track(self.next_track_id, det_box, emb, det_score, det_class)
+            if det_emb is not None:
+                if is_valid:
+                    new_track.add_embedding(det_emb, quality)
+                    self._update_gallery(self.next_track_id, det_emb, quality)
+                else:
+                    new_track.add_embedding(det_emb, 0.1)
+                    self._update_gallery(self.next_track_id, det_emb, 0.1)
+            else:
+                self._update_gallery(self.next_track_id, None, 0.0)
+                
+            self.tracks.append(new_track)
+            matched_tracks.append(new_track)
+            final_mapped_ids[d_idx] = self.next_track_id
             self.next_track_id += 1
             
-            self.tracks.append(new_track)
-            final_matched_tracks.append(new_track)
-            final_matched_det_indices.append(d_idx)
-            
-        # Stage 5: Age unmatched tracks
+        # Age unmatched tracks
         for track in self.tracks:
-            if track not in final_matched_tracks:
+            if track not in matched_tracks:
                 track.time_since_update += 1
-            
+                
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         
-        # Sort matched tracks parallel to input detection order
-        sorted_pairs = sorted(zip(final_matched_det_indices, final_matched_tracks), key=lambda x: x[0])
-        tracker_ids_list = [track.track_id for _, track in sorted_pairs]
-        tracker_ids = np.array(tracker_ids_list, dtype=np.int32)
+        tracker_ids = np.array(final_mapped_ids, dtype=np.int32)
         
-        # Stage 6: Update tracker IDs and return
         if not is_numpy:
-            # Set the tracker IDs on the detections object in-place
             if hasattr(detections, '_tracker_id'):
                 detections._tracker_id = tracker_ids
             if hasattr(detections, 'tracker_id'):
@@ -463,15 +705,12 @@ class BoTSORTTracker:
                     pass
             return detections
         else:
-            # Build and return NumPy structured array
-            if len(sorted_pairs) == 0:
-                return np.zeros(0, dtype=new_dtype)
-            tracked_arr = np.zeros(len(sorted_pairs), dtype=new_dtype)
-            for i, (d_idx, track) in enumerate(sorted_pairs):
-                tracked_arr['box'][i] = track.box
-                tracked_arr['confidence'][i] = track.score
-                tracked_arr['class_id'][i] = track.class_id
-                tracked_arr['track_id'][i] = track.track_id
+            tracked_arr = np.zeros(num_dets, dtype=new_dtype)
+            for i in range(num_dets):
+                tracked_arr['box'][i] = boxes[i]
+                tracked_arr['confidence'][i] = scores[i]
+                tracked_arr['class_id'][i] = class_ids[i]
+                tracked_arr['track_id'][i] = final_mapped_ids[i]
             return tracked_arr
 
 
@@ -502,6 +741,30 @@ def get_args():
         default=2592000,
         help="Maximum frames to keep an inactive track in memory (default: 2592000)"
     )
+    parser.add_argument(
+        "--reid-model-path",
+        type=str,
+        default="~/models/repvgg_a0_person_reid_512.hef",
+        help="Path to compiled ReID HEF model (default: ~/models/repvgg_a0_person_reid_512.hef)"
+    )
+    parser.add_argument(
+        "--w-iou",
+        type=float,
+        default=0.4,
+        help="Hungarian matching weight for IoU cost (default: 0.4)"
+    )
+    parser.add_argument(
+        "--w-app",
+        type=float,
+        default=0.4,
+        help="Hungarian matching weight for appearance cost (default: 0.4)"
+    )
+    parser.add_argument(
+        "--w-motion",
+        type=float,
+        default=0.2,
+        help="Hungarian matching weight for motion consistency cost (default: 0.2)"
+    )
     return parser.parse_args()
 
 
@@ -526,10 +789,12 @@ def main():
 
     # Initialize BoTSORT Tracker (combining tracking and ReID) with user-configurable parameters to prevent early embedding removal
     tracker = BoTSORTTracker(
-        reid_model_name='osnet_x1_0',
+        reid_model_path=args.reid_model_path,
         reid_threshold=args.reid_threshold,
-        device='cpu',
-        max_age=args.max_age
+        max_age=args.max_age,
+        w_iou=args.w_iou,
+        w_app=args.w_app,
+        w_motion=args.w_motion
     )
     
     unique_seen_people = set()
@@ -580,6 +845,8 @@ def main():
     finally:
         if streamer:
             streamer.close()
+        if 'tracker' in locals():
+            tracker.close()
 
 
 if __name__ == "__main__":

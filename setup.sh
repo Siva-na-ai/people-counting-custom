@@ -43,17 +43,13 @@ source venv/bin/activate
 echo "Upgrading pip..."
 pip install --upgrade pip
 
-# Install PyTorch & torchvision first
-echo "Installing PyTorch & torchvision..."
-pip install torch torchvision
-
 # Install packages from requirements.txt
 if [ -f requirements.txt ]; then
     echo "Installing dependencies from requirements.txt..."
     pip install -r requirements.txt
 else
     echo "Installing standard dependencies..."
-    pip install numpy opencv-python torchreid
+    pip install numpy opencv-python
 fi
 
 # Install modlib from Sony Github repository

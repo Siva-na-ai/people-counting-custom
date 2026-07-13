@@ -1,7 +1,5 @@
 numpy
 opencv-python
-torch
-torchvision
 scipy
 gdown
 scikit-learn
@@ -15,7 +13,6 @@ tensorboard
 future
 imageio
 chardet
-torchreid
 git+https://github.com/SonySemiconductorSolutions/aitrios-rpi-application-module-library.git
 psycopg2-binary
 python-dotenv
