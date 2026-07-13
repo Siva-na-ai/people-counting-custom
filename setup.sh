@@ -33,7 +33,7 @@ fi
 
 # Create virtual environment
 echo "Creating virtual environment 'venv'..."
-python3 -m venv venv
+python3 -m venv --system-site-packages venv
 
 # Activate venv
 echo "Activating virtual environment..."
