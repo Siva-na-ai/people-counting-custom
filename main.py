@@ -36,6 +36,7 @@ class PipelineRunner:
             while True:
                 ret, frame = cap.read()
                 if not ret:
+                    print("❌ Error: Failed to read frame from camera. (Is the camera plugged in and accessible?)")
                     break
                     
                 # 1. Detection
