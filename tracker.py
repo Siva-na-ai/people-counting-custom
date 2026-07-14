@@ -1,0 +1,270 @@
+import cv2
+import torch
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+try:
+    from torchreid.utils import FeatureExtractor
+except ImportError:
+    try:
+        from torchreid.reid.utils import FeatureExtractor
+    except ImportError:
+        pass
+
+def compute_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = box1_area + box2_area - inter_area
+    
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+class Track:
+    def __init__(self, track_id, box, embedding, score, class_id):
+        self.track_id = track_id
+        self.box = box
+        self.score = score
+        self.class_id = class_id
+        self.embeddings = [embedding] if embedding is not None else []
+        self.time_since_update = 0
+
+class BoTSORTTracker:
+    def __init__(self, reid_model_name='osnet_x1_0', reid_threshold=0.58, device='cpu', max_age=900):
+        self.max_age = max_age
+        self.reid_threshold = reid_threshold
+        
+        try:
+            self.extractor = FeatureExtractor(
+                model_name=reid_model_name,
+                device=device
+            )
+        except NameError:
+            self.extractor = None
+            
+        self.tracks = []
+        self.next_track_id = 1
+        
+    def get_crop(self, image, box):
+        h, w, _ = image.shape
+        if any(coord > 2.0 for coord in box):
+            xmin = int(max(0, box[0]))
+            ymin = int(max(0, box[1]))
+            xmax = int(min(w, box[2]))
+            ymax = int(min(h, box[3]))
+        else:
+            xmin = int(max(0, box[0] * w))
+            ymin = int(max(0, box[1] * h))
+            xmax = int(min(w, box[2] * w))
+            ymax = int(min(h, box[3] * h))
+            
+        if xmax <= xmin or ymax <= ymin:
+            return None
+            
+        crop = image[ymin:ymax, xmin:xmax]
+        return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+    def extract_embedding(self, crop):
+        if not self.extractor:
+            return np.random.randn(512).astype(np.float32)
+        with torch.no_grad():
+            features = self.extractor([crop])
+            embedding = features[0].cpu().numpy()
+            norm = np.linalg.norm(embedding)
+            if norm > 0:
+                embedding = embedding / norm
+            return embedding
+
+    def update(self, frame_image, detections):
+        return self._update_impl(frame_image, detections)
+
+    def _update_impl(self, frame_image, detections):
+        num_dets = len(detections)
+        descr = [('box', '<f4', (4,)), ('confidence', '<f4'), ('class_id', '<i4'), ('track_id', '<i4')]
+        new_dtype = np.dtype(descr)
+        
+        if num_dets == 0:
+            for track in self.tracks:
+                track.time_since_update += 1
+            self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+            if isinstance(detections, np.ndarray):
+                return np.zeros(0, dtype=new_dtype)
+            return detections
+            
+        boxes = []
+        scores = []
+        class_ids = []
+        
+        is_numpy = isinstance(detections, np.ndarray)
+        
+        if not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
+            boxes = detections.coords
+            scores = detections.confidence
+            class_ids = detections.class_id
+        elif is_numpy and detections.dtype.names is not None:
+            names = detections.dtype.names
+            box_field = 'box' if 'box' in names else (names[0] if len(names) > 0 else None)
+            score_field = 'confidence' if 'confidence' in names else ('score' if 'score' in names else (names[1] if len(names) > 1 else None))
+            class_field = 'class_id' if 'class_id' in names else (names[2] if len(names) > 2 else None)
+            
+            for d_idx in range(num_dets):
+                boxes.append(detections[d_idx][box_field] if box_field else detections[d_idx][0])
+                scores.append(detections[d_idx][score_field] if score_field else detections[d_idx][1])
+                class_ids.append(detections[d_idx][class_field] if class_field else detections[d_idx][2])
+        else:
+            for det in detections:
+                det_tuple = tuple(det)
+                boxes.append(det_tuple[0])
+                scores.append(det_tuple[1])
+                class_ids.append(det_tuple[2])
+                
+        active_tracks = self.tracks
+        
+        matched_track_indices = []
+        matched_det_indices = []
+        
+        iou_tracks = [t for t in active_tracks if t.time_since_update == 0]
+        num_iou_tracks = len(iou_tracks)
+        
+        if num_iou_tracks > 0 and num_dets > 0:
+            iou_matrix = np.zeros((num_iou_tracks, num_dets))
+            for t_idx, track in enumerate(iou_tracks):
+                for d_idx in range(num_dets):
+                    det_box = boxes[d_idx]
+                    if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                        det_box = det_box.flatten()
+                    iou_matrix[t_idx, d_idx] = compute_iou(track.box, det_box)
+            
+            cost_matrix = 1.0 - iou_matrix
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                if iou_matrix[r, c] >= 0.50:
+                    matched_track_indices.append(r)
+                    matched_det_indices.append(c)
+                    
+        matched_tracks = [iou_tracks[r] for r in matched_track_indices]
+        matched_det_indices = list(matched_det_indices)
+        
+        unmatched_tracks = [t for t in active_tracks if t not in matched_tracks]
+        unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
+        
+        if len(unmatched_tracks) > 0 and len(unmatched_det_indices) > 0:
+            det_embeddings = []
+            valid_det_indices = []
+            
+            for d_idx in unmatched_det_indices:
+                det_box = boxes[d_idx]
+                if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                    det_box = det_box.flatten()
+                crop = self.get_crop(frame_image, det_box)
+                if crop is not None:
+                    emb = self.extract_embedding(crop)
+                    det_embeddings.append(emb)
+                    valid_det_indices.append(d_idx)
+                    
+            if len(det_embeddings) > 0 and any(len(t.embeddings) > 0 for t in unmatched_tracks):
+                reid_cost_matrix = np.ones((len(unmatched_tracks), len(det_embeddings)))
+                
+                for i, track in enumerate(unmatched_tracks):
+                    if len(track.embeddings) == 0:
+                        continue
+                    for j, det_emb in enumerate(det_embeddings):
+                        sims = [np.dot(det_emb, stored_emb) for stored_emb in track.embeddings]
+                        max_sim = max(sims) if sims else 0.0
+                        reid_cost_matrix[i, j] = 1.0 - max_sim
+                
+                r_ind, c_ind = linear_sum_assignment(reid_cost_matrix)
+                
+                for r, c in zip(r_ind, c_ind):
+                    max_sim = 1.0 - reid_cost_matrix[r, c]
+                    if max_sim >= self.reid_threshold:
+                        track = unmatched_tracks[r]
+                        d_idx = valid_det_indices[c]
+                        
+                        matched_tracks.append(track)
+                        matched_det_indices.append(d_idx)
+                        track.embeddings.append(det_embeddings[c])
+                        if len(track.embeddings) > 10:
+                            track.embeddings.pop(0)
+                            
+        final_matched_tracks = []
+        final_matched_det_indices = []
+        matched_pairs = sorted(zip(matched_tracks, matched_det_indices), key=lambda x: x[1])
+        
+        for track, d_idx in matched_pairs:
+            det_box = boxes[d_idx]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            det_score = scores[d_idx]
+            if isinstance(det_score, np.ndarray):
+                det_score = float(det_score.item())
+            det_class = class_ids[d_idx]
+            if isinstance(det_class, np.ndarray):
+                det_class = int(det_class.item())
+            
+            track.box = det_box
+            track.score = det_score
+            track.class_id = det_class
+            track.time_since_update = 0
+            
+            final_matched_tracks.append(track)
+            final_matched_det_indices.append(d_idx)
+            
+        all_unmatched_det_indices = [d for d in range(num_dets) if d not in final_matched_det_indices]
+        for d_idx in all_unmatched_det_indices:
+            det_box = boxes[d_idx]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            det_score = scores[d_idx]
+            if isinstance(det_score, np.ndarray):
+                det_score = float(det_score.item())
+            det_class = class_ids[d_idx]
+            if isinstance(det_class, np.ndarray):
+                det_class = int(det_class.item())
+            
+            crop = self.get_crop(frame_image, det_box)
+            emb = self.extract_embedding(crop) if crop is not None else None
+            
+            new_track = Track(self.next_track_id, det_box, emb, det_score, det_class)
+            self.next_track_id += 1
+            
+            self.tracks.append(new_track)
+            final_matched_tracks.append(new_track)
+            final_matched_det_indices.append(d_idx)
+            
+        for track in self.tracks:
+            if track not in final_matched_tracks:
+                track.time_since_update += 1
+            
+        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        
+        sorted_pairs = sorted(zip(final_matched_det_indices, final_matched_tracks), key=lambda x: x[0])
+        tracker_ids_list = [track.track_id for _, track in sorted_pairs]
+        tracker_ids = np.array(tracker_ids_list, dtype=np.int32)
+        
+        if not is_numpy:
+            if hasattr(detections, '_tracker_id'):
+                detections._tracker_id = tracker_ids
+            if hasattr(detections, 'tracker_id'):
+                try:
+                    detections.tracker_id = tracker_ids
+                except AttributeError:
+                    pass
+            return detections
+        else:
+            if len(sorted_pairs) == 0:
+                return np.zeros(0, dtype=new_dtype)
+            tracked_arr = np.zeros(len(sorted_pairs), dtype=new_dtype)
+            for i, (d_idx, track) in enumerate(sorted_pairs):
+                tracked_arr['box'][i] = track.box
+                tracked_arr['confidence'][i] = track.score
+                tracked_arr['class_id'][i] = track.class_id
+                tracked_arr['track_id'][i] = track.track_id
+            return tracked_arr

@@ -61,6 +61,17 @@ echo "Installing Sony modlib AITRIOS SDK..."
 pip install git+https://github.com/SonySemiconductorSolutions/aitrios-rpi-application-module-library.git
 
 echo "=================================================="
+echo "   Setting up Qdrant Vector Database              "
+echo "=================================================="
+if ! command -v docker &> /dev/null; then
+    echo "⚠️  Docker is not installed. You will need Docker to run Qdrant locally."
+    echo "Install docker with: curl -fsSL https://get.docker.com -o get-docker.sh && sh get-docker.sh"
+else
+    echo "Docker found. You can start Qdrant by running:"
+    echo "   docker run -d -p 6333:6333 -p 6334:6334 qdrant/qdrant"
+fi
+
+echo "=================================================="
 echo "   Setup Complete!                                "
 echo "=================================================="
 echo "To activate the virtual environment, run:"
