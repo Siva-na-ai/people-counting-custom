@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import time
+import subprocess
+import os
 from face_detector import FaceDetector
 from face_alignment import FaceAlignment
 from face_recognition import FaceRecognition
@@ -10,9 +12,38 @@ from qdrant_db import QdrantIdentityClient
 from embedding_quality import EmbeddingQuality
 import config
 
+class LibcameraReader:
+    def __init__(self, width=640, height=480, fps=15):
+        cmd = [
+            "libcamera-vid", "-t", "0", "--inline", "1",
+            "--width", str(width), "--height", str(height), 
+            "--framerate", str(fps), "--codec", "mjpeg", "-o", "-"
+        ]
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.buffer = b''
+
+    def isOpened(self):
+        return self.process.poll() is None
+
+    def read(self):
+        while True:
+            chunk = self.process.stdout.read(4096)
+            if not chunk: return False, None
+            self.buffer += chunk
+            a = self.buffer.find(b'\xff\xd8')
+            b = self.buffer.find(b'\xff\xd9')
+            if a != -1 and b != -1:
+                jpg = self.buffer[a:b+2]
+                self.buffer = self.buffer[b+2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None: return True, frame
+
+    def release(self):
+        self.process.terminate()
+
 class PipelineRunner:
     def __init__(self):
-        print("[*] Initializing AI Models...")
+        print("[*] Loading AI Models (InsightFace)...")
         self.face_detector = FaceDetector(threshold=config.DETECTION_CONFIDENCE)
         self.face_aligner = FaceAlignment()
         self.face_rec = FaceRecognition()
@@ -26,18 +57,19 @@ class PipelineRunner:
         self.camera_id = "cam_01"
         
     def run(self, source=0):
-        cap = cv2.VideoCapture(source)
-        # Try V4L2 backend if the default one fails
-        if not cap.isOpened() and isinstance(source, int):
-            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if isinstance(source, int) and os.path.exists("/usr/bin/libcamera-vid"):
+            print("[*] Raspberry Pi Detected: Using native LibcameraReader!")
+            cap = LibcameraReader(width=640, height=480, fps=15)
+        else:
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened() and isinstance(source, int):
+                cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             
         if not cap.isOpened():
             print("Error: Could not open camera")
             return
-            
-        # Force a specific resolution to prevent buffer size mismatches (the "reshape" error)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             
         print("[*] Streaming started. Warming up camera...")
         
