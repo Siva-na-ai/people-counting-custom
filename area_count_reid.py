@@ -643,48 +643,122 @@ class Track:
         self.class_id = class_id
         self.embeddings = [embedding] if embedding is not None else []
         self.quality_scores = [1.0] if embedding is not None else []
+        self.embedding_times = [datetime.now()] if embedding is not None else []
         self.time_since_update = 0
         self.update_count = 0
         self.history = [] # list of (cx, cy) center points
         self.state = state
-        self.hits = 1
+        self.hits = 1 if score >= 0.70 else 0
+        self.velocity = np.zeros(2)
+        self.person_id = None
 
     def add_embedding(self, embedding: np.ndarray, quality_score: float):
         if embedding is None:
             return
+            
+        # Prevent gallery pollution: check similarity against existing embeddings using Top-3 average
+        if len(self.embeddings) > 0:
+            sims = [np.dot(embedding, stored_emb) for stored_emb in self.embeddings]
+            sorted_sims = sorted(sims, reverse=True)
+            top_sim = np.mean(sorted_sims[:3]) if sorted_sims else 0.0
+            if top_sim < 0.50:
+                return  # Reject polluted embedding
+                
+        now = datetime.now()
+        # Compute time-decayed quality scores
+        decayed_qs = []
+        for q, t in zip(self.quality_scores, self.embedding_times):
+            dt_hours = (now - t).total_seconds() / 3600.0
+            decayed_qs.append(q * np.exp(-0.105 * dt_hours))
+            
         if len(self.embeddings) < 5:
             self.embeddings.append(embedding)
             self.quality_scores.append(quality_score)
+            self.embedding_times.append(now)
         else:
-            # Replace the lowest quality embedding if the new one is better
-            min_idx = np.argmin(self.quality_scores)
-            if quality_score > self.quality_scores[min_idx]:
+            # Replace the lowest decayed quality embedding if the new one is better
+            min_idx = np.argmin(decayed_qs)
+            if quality_score > decayed_qs[min_idx]:
                 self.embeddings[min_idx] = embedding
                 self.quality_scores[min_idx] = quality_score
+                self.embedding_times[min_idx] = now
+
+import config
+from qdrant_client import QdrantClient
+from worker_pool import WorkerPool
+from gallery_manager import GalleryManager
+from person_registry import PersonRegistry
+from movement_validator import MovementValidator
+from temporal_validator import TemporalValidator
+from embedding_cache import EmbeddingCache
+from event_logger import EventLogger
+from face_detector import HailoFaceDetector
+from face_recognition import HailoFaceRecognizer
+from identity_matcher import IdentityMatcher
+from fusion_engine import FusionEngine
+from identity_manager import IdentityManager
+from duplicate_resolver import DuplicateIdentityResolver
 
 class BoTSORTTracker:
-    def __init__(self, reid_model_path: str = '~/models/repvgg_a0_person_reid_512.hef', reid_threshold: float = 0.70, max_age: int = 900, w_iou: float = 0.4, w_app: float = 0.4, w_motion: float = 0.2):
+    def __init__(self, reid_model_path: str = '~/models/repvgg_a0_person_reid_512.hef', reid_threshold: float = 0.70, max_age: int = 900, w_iou: float = 0.4, w_app: float = 0.4, w_motion: float = 0.2, camera_id: int = 1):
         self.max_age = max_age
         self.reid_threshold = reid_threshold
         self.w_iou = w_iou
         self.w_app = w_app
         self.w_motion = w_motion
         self.gating_threshold = 0.70
+        self.camera_id = camera_id
         
-        # Initialize ReID engine
+        # Initialize ReID engine (body)
         self.reid = HailoReID(hef_path=reid_model_path)
         self.tracks = []
         self.next_track_id = 1
+        self.next_person_id = 1
         
-        # Persistent global gallery: person_id -> {best_embedding, embeddings, quality_scores, last_seen, hit_count}
-        self.global_gallery = {}
+        # Initialize Qdrant and production components
+        self.qdrant = QdrantClient()
+        self.worker_pool = WorkerPool()
+        self.gallery_mgr = GalleryManager()
+        self.registry = PersonRegistry(qdrant_client=self.qdrant)
+        self.registry.lock = threading.Lock()
+        self.event_logger = EventLogger()
+        
+        self.movement_val = MovementValidator()
+        self.temporal_val = TemporalValidator()
+        self.cache = EmbeddingCache()
+        
+        self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry)
+        self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
+        
+        # Load Hailo Face engines
+        self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH)
+        self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH)
+        
+        # Pipeline Coordinator
+        self.identity_mgr = IdentityManager(
+            self.qdrant, self.worker_pool, self.gallery_mgr, self.registry, self.fusion,
+            self.face_det, self.face_rec, self.reid, self.cache, self.event_logger
+        )
         
     def close(self):
         if hasattr(self, 'reid') and self.reid:
             self.reid.close()
+        if hasattr(self, 'face_det') and self.face_det:
+            self.face_det.close()
+        if hasattr(self, 'face_rec') and self.face_rec:
+            self.face_rec.close()
+        if hasattr(self, 'worker_pool') and self.worker_pool:
+            self.worker_pool.stop()
             
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
+            
+    def _resolve_duplicates_task(self, active_pids):
+        resolver = DuplicateIdentityResolver(self.registry, self.gallery_mgr, self.qdrant)
+        resolver.check_and_resolve_duplicates(active_pids)
         
     def get_crop(self, image: np.ndarray, box: np.ndarray) -> np.ndarray:
         """
@@ -735,11 +809,11 @@ class BoTSORTTracker:
         if box_w <= 0 or box_h <= 0 or xmin >= xmax or ymin >= ymax:
             return False
             
-        # 1. Aspect ratio validation (persons are vertical, typically aspect ratio height/width >= 1.1 and <= 4.5)
+        # 1. Aspect ratio validation (persons are vertical, typically aspect ratio height/width >= 1.0 and <= 5.0)
         aspect_ratio = box_h / box_w
-        if aspect_ratio < 1.1: # Reject horizontal or too-square boxes (shadows, reflections, bags, head-only)
+        if aspect_ratio < 1.0: # Reject horizontal or too-square boxes (shadows, reflections, bags, head-only)
             return False
-        if aspect_ratio > 4.5: # Reject extremely thin vertical lines (poles, shelf edges)
+        if aspect_ratio > 5.0: # Reject extremely thin vertical lines (poles, shelf edges)
             return False
             
         # 2. Scale check (reject tiny boxes)
@@ -756,7 +830,7 @@ class BoTSORTTracker:
         box_area = box_w * box_h
         visible_pct = inter_area / box_area if box_area > 0 else 0.0
         
-        if visible_pct < 0.65:
+        if visible_pct < 0.50:
             return False
             
         return True
@@ -781,7 +855,7 @@ class BoTSORTTracker:
         except Exception:
             return False, 0.0
             
-        if lap_var < 80.0:
+        if lap_var < 45.0:
             return False, 0.0
             
         # Lighting check (mean brightness)
@@ -827,33 +901,7 @@ class BoTSORTTracker:
             
         return keep
 
-    def _update_gallery(self, person_id: int, embedding: np.ndarray, quality_score: float):
-        if person_id not in self.global_gallery:
-            self.global_gallery[person_id] = {
-                'best_embedding': None,
-                'embeddings': [],
-                'quality_scores': [],
-                'last_seen': datetime.now(),
-                'hit_count': 0
-            }
-            
-        entry = self.global_gallery[person_id]
-        entry['last_seen'] = datetime.now()
-        entry['hit_count'] += 1
-        
-        if embedding is not None:
-            if len(entry['embeddings']) < 5:
-                entry['embeddings'].append(embedding)
-                entry['quality_scores'].append(quality_score)
-            else:
-                min_idx = np.argmin(entry['quality_scores'])
-                if quality_score > entry['quality_scores'][min_idx]:
-                    entry['embeddings'][min_idx] = embedding
-                    entry['quality_scores'][min_idx] = quality_score
-                    
-            # Recalculate best_embedding
-            max_idx = np.argmax(entry['quality_scores'])
-            entry['best_embedding'] = entry['embeddings'][max_idx]
+
 
     def update(self, frame_image: np.ndarray, detections) -> np.ndarray:
         try:
@@ -957,7 +1005,9 @@ class BoTSORTTracker:
             det_embeddings.append(emb)
             det_qualities.append((is_valid, quality))
             
-        num_tracks = len(self.tracks)
+        # Filter tracks for main Hungarian matching to those updated within the last 30 frames
+        main_stage_tracks = [t for t in self.tracks if t.time_since_update <= 30]
+        num_tracks = len(main_stage_tracks)
         matched_tracks = []
         matched_det_indices = []
         
@@ -981,17 +1031,12 @@ class BoTSORTTracker:
         if num_tracks > 0:
             cost_matrix = np.zeros((num_tracks, num_dets))
             
-            for t_idx, track in enumerate(self.tracks):
-                # Predict current position using velocity model
-                if len(track.history) >= 2:
+            for t_idx, track in enumerate(main_stage_tracks):
+                # Predict current position using smoothed velocity model
+                if len(track.history) >= 1 and not np.all(track.velocity == 0.0):
                     c_last = track.history[-1]
-                    c_prev = track.history[-2]
-                    v_x = c_last[0] - c_prev[0]
-                    v_y = c_last[1] - c_prev[1]
-                    pred_cx = c_last[0] + v_x * (track.time_since_update + 1)
-                    pred_cy = c_last[1] + v_y * (track.time_since_update + 1)
-                elif len(track.history) == 1:
-                    pred_cx, pred_cy = track.history[0]
+                    pred_cx = c_last[0] + track.velocity[0] * (track.time_since_update + 1)
+                    pred_cy = c_last[1] + track.velocity[1] * (track.time_since_update + 1)
                 else:
                     pred_cx = (track.box[0] + track.box[2]) / 2.0
                     pred_cy = (track.box[1] + track.box[3]) / 2.0
@@ -1000,17 +1045,14 @@ class BoTSORTTracker:
                 track_h = track.box[3] - track.box[1]
                 diag = np.sqrt(track_w**2 + track_h**2)
                 
-                # Occlusion-aware weight shift
-                is_occluded = track.track_id in occluded_tracks
-                if is_occluded:
-                    w_iou = 0.1
-                    w_app = 0.6
-                    w_motion = 0.3
+                # Dynamic ReID threshold based on track state
+                if track.time_since_update <= 1:
+                    reid_thresh = 0.82
+                elif track.time_since_update <= 3:
+                    reid_thresh = 0.80
                 else:
-                    w_iou = self.w_iou
-                    w_app = self.w_app
-                    w_motion = self.w_motion
-                    
+                    reid_thresh = 0.76
+                
                 for d_idx in range(num_dets):
                     det_box = boxes[d_idx]
                     if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
@@ -1030,26 +1072,51 @@ class BoTSORTTracker:
                     det_emb = det_embeddings[d_idx]
                     if len(track.embeddings) > 0 and det_emb is not None:
                         sims = [np.dot(det_emb, stored_emb) for stored_emb in track.embeddings]
-                        max_sim = max(sims) if sims else 0.0
-                        C_app = float(1.0 - max_sim)
+                        sorted_sims = sorted(sims, reverse=True)
+                        sim_score = np.mean(sorted_sims[:3]) if sorted_sims else 0.0
+                        C_app = float(1.0 - sim_score)
                         has_app = True
                     else:
                         C_app = 1.0
                         has_app = False
                         
+                    # Occlusion-aware weight shift
+                    is_occluded = track.track_id in occluded_tracks
+                    if is_occluded and has_app:
+                        w_iou_f = 0.1
+                        w_app_f = 0.6
+                        w_motion_f = 0.3
+                    else:
+                        w_iou_f = self.w_iou
+                        w_app_f = self.w_app
+                        w_motion_f = self.w_motion
+                        
+                    # Motion validation check (reject matches violating maximum velocity normalized by object size)
+                    dist_px = np.sqrt(((det_cx - pred_cx) * img_w)**2 + ((det_cy - pred_cy) * img_h)**2)
+                    diag_px = np.sqrt((track_w * img_w)**2 + (track_h * img_h)**2)
                     if track.time_since_update <= 3:
+                        max_motion = 3.0 * diag_px
+                    else:
+                        max_motion = (4.0 + 0.2 * track.time_since_update) * diag_px
+                        
+                    if dist_px > max_motion:
+                        cost = 1e5
+                    elif track.time_since_update <= 3:
                         if has_app:
-                            cost = w_iou * C_iou + w_app * C_app + w_motion * C_motion
+                            if sim_score < reid_thresh:
+                                cost = 1e5
+                            else:
+                                cost = w_iou_f * C_iou + w_app_f * C_app + w_motion_f * C_motion
                         else:
-                            total_w = w_iou + w_motion
+                            total_w = w_iou_f + w_motion_f
                             if total_w > 0:
-                                cost = (w_iou / total_w) * C_iou + (w_motion / total_w) * C_motion
+                                cost = (w_iou_f / total_w) * C_iou + (w_motion_f / total_w) * C_motion
                             else:
                                 cost = C_iou
                     else:
                         if has_app:
                             cost = C_app
-                            if max_sim < self.reid_threshold:
+                            if sim_score < reid_thresh:
                                 cost = 1e5
                         else:
                             cost = 1e5
@@ -1061,9 +1128,18 @@ class BoTSORTTracker:
                     
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             
+            # Pre-compute current frame occluded detection indices
+            occluded_det_indices = set()
+            for i in range(num_dets):
+                for j in range(num_dets):
+                    if i != j:
+                        if compute_iou(boxes[i], boxes[j]) > 0.40:
+                            occluded_det_indices.add(i)
+                            occluded_det_indices.add(j)
+
             for r, c in zip(row_ind, col_ind):
                 if cost_matrix[r, c] < 1e4:
-                    track = self.tracks[r]
+                    track = main_stage_tracks[r]
                     matched_tracks.append(track)
                     matched_det_indices.append(c)
                     
@@ -1071,10 +1147,10 @@ class BoTSORTTracker:
                     track.score = float(scores[c].item()) if isinstance(scores[c], np.ndarray) else float(scores[c])
                     track.class_id = int(class_ids[c].item()) if isinstance(class_ids[c], np.ndarray) else int(class_ids[c])
                     track.time_since_update = 0
-                    track.hits += 1
                     
-                    # Probation state promotion (Tentative -> Confirmed)
-                    if track.state == 'Tentative' and track.hits >= 3:
+                    if track.score >= 0.70:
+                        track.hits += 1
+                    if track.state == 'Tentative' and track.hits >= 5:
                         track.state = 'Confirmed'
                         
                     cx = (track.box[0] + track.box[2]) / 2.0
@@ -1083,151 +1159,97 @@ class BoTSORTTracker:
                     if len(track.history) > 10:
                         track.history.pop(0)
                         
-                    det_emb = det_embeddings[c]
-                    is_valid, quality = det_qualities[c]
-                    if is_valid and det_emb is not None:
-                        track.add_embedding(det_emb, quality)
-                        self._update_gallery(track.track_id, det_emb, quality)
-                    else:
-                        self._update_gallery(track.track_id, None, 0.0)
-                        
-                    track.update_count += 1
-                    
-                    # Confidence Fusion
-                    det_conf = track.score
-                    app_sim = 0.0
-                    if len(track.embeddings) > 0 and det_emb is not None:
-                        app_sim = max([np.dot(det_emb, stored_emb) for stored_emb in track.embeddings])
-                    track_w = track.box[2] - track.box[0]
-                    track_h = track.box[3] - track.box[1]
-                    diag = np.sqrt(track_w**2 + track_h**2)
+                    # Smooth velocity update using EMA
                     if len(track.history) >= 2:
-                        c_last = track.history[-1]
-                        c_prev = track.history[-2]
-                        dist = np.sqrt((c_last[0] - c_prev[0])**2 + (c_last[1] - c_prev[1])**2)
-                        dist_norm = dist / diag if diag > 0 else dist
-                        motion_sim = np.exp(-2.0 * dist_norm)
-                    else:
-                        motion_sim = 1.0
-                    age_factor = min(1.0, track.hits / 10.0)
+                        prev_cx, prev_cy = track.history[-2]
+                        current_vel = np.array([cx - prev_cx, cy - prev_cy])
+                        if np.all(track.velocity == 0.0):
+                            track.velocity = current_vel
+                        else:
+                            track.velocity = 0.7 * track.velocity + 0.3 * current_vel
+                            
+                    # Run modular Face + Body Fusion Identity Manager pipeline
+                    is_occluded = (c in occluded_det_indices)
                     
-                    fused_conf = 0.4 * det_conf + 0.3 * app_sim + 0.2 * motion_sim + 0.1 * age_factor
+                    def get_pid():
+                        if track.person_id is not None:
+                            return track.person_id
+                        return self.next_person_id
+
+                    pid, state, conf = self.identity_mgr.process_observation(
+                        frame_image, track.track_id, track.box, track.score, track.time_since_update, self.camera_id, get_pid, is_occluded
+                    )
                     
-                    final_mapped_ids[c] = track.track_id
-                    final_mapped_states[c] = track.state
-                    final_mapped_confs[c] = float(fused_conf)
+                    if pid == self.next_person_id:
+                        self.next_person_id += 1
+                        
+                    track.person_id = pid
                     
-        # 4. Re-identify remaining unmatched detections via Global ReID Gallery
+                    final_mapped_ids[c] = track.person_id
+                    final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
+                    final_mapped_confs[c] = float(conf)
+                    
+        # 4 & 5. Process unmatched detections (re-identify or create new tracks)
         unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
-        valid_unmatched_det_indices = [d for d in unmatched_det_indices if det_embeddings[d] is not None]
-        
-        active_ids = {t.track_id for t in matched_tracks}
-        inactive_gallery_ids = [pid for pid in self.global_gallery.keys() if pid not in active_ids]
-        
-        if len(valid_unmatched_det_indices) > 0 and len(inactive_gallery_ids) > 0:
-            gallery_cost = np.ones((len(inactive_gallery_ids), len(valid_unmatched_det_indices)))
-            
-            for i, pid in enumerate(inactive_gallery_ids):
-                entry = self.global_gallery[pid]
-                for j, d_idx in enumerate(valid_unmatched_det_indices):
-                    det_emb = det_embeddings[d_idx]
-                    sims = [np.dot(det_emb, stored_emb) for stored_emb in entry['embeddings']]
-                    max_sim = max(sims) if sims else 0.0
-                    if max_sim >= self.reid_threshold:
-                        gallery_cost[i, j] = float(1.0 - max_sim)
-                    else:
-                        gallery_cost[i, j] = 1e5
-                        
-            r_ind, c_ind = linear_sum_assignment(gallery_cost)
-            
-            for r, c in zip(r_ind, c_ind):
-                if gallery_cost[r, c] < 1e4:
-                    pid = inactive_gallery_ids[r]
-                    d_idx = valid_unmatched_det_indices[c]
-                    
-                    det_box = boxes[d_idx]
-                    if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
-                        det_box = det_box.flatten()
-                    det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
-                    det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
-                    det_emb = det_embeddings[d_idx]
-                    is_valid, quality = det_qualities[d_idx]
-                    
-                    # Returning person track starts immediately as Confirmed
-                    new_track = Track(pid, det_box, None, det_score, det_class, state='Confirmed')
-                    entry = self.global_gallery[pid]
-                    new_track.embeddings = list(entry['embeddings'])
-                    new_track.quality_scores = list(entry['quality_scores'])
-                    new_track.hits = entry['hit_count'] + 1
-                    
-                    cx = (det_box[0] + det_box[2]) / 2.0
-                    cy = (det_box[1] + det_box[3]) / 2.0
-                    new_track.history.append((cx, cy))
-                    
-                    if is_valid and det_emb is not None:
-                        new_track.add_embedding(det_emb, quality)
-                        self._update_gallery(pid, det_emb, quality)
-                    else:
-                        self._update_gallery(pid, None, 0.0)
-                        
-                    self.tracks.append(new_track)
-                    matched_tracks.append(new_track)
-                    
-                    app_sim = max([np.dot(det_emb, stored_emb) for stored_emb in new_track.embeddings]) if det_emb is not None else 0.0
-                    age_factor = min(1.0, new_track.hits / 10.0)
-                    fused_conf = 0.4 * det_score + 0.3 * app_sim + 0.2 * 1.0 + 0.1 * age_factor
-                    
-                    final_mapped_ids[d_idx] = pid
-                    final_mapped_states[d_idx] = 'Confirmed'
-                    final_mapped_confs[d_idx] = float(fused_conf)
-                    unmatched_det_indices.remove(d_idx)
-                    
-        # 5. Create new tracks for the remaining unmatched detections (State = Tentative)
         for d_idx in unmatched_det_indices:
             det_box = boxes[d_idx]
             if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
                 det_box = det_box.flatten()
             det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
             det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
-            det_emb = det_embeddings[d_idx]
-            is_valid, quality = det_qualities[d_idx]
             
             new_track = Track(self.next_track_id, det_box, None, det_score, det_class, state='Tentative')
+            self.next_track_id += 1
+            
             cx = (det_box[0] + det_box[2]) / 2.0
             cy = (det_box[1] + det_box[3]) / 2.0
             new_track.history.append((cx, cy))
             
-            if det_emb is not None:
-                if is_valid:
-                    new_track.add_embedding(det_emb, quality)
-                    self._update_gallery(self.next_track_id, det_emb, quality)
-                else:
-                    new_track.add_embedding(det_emb, 0.1)
-                    self._update_gallery(self.next_track_id, det_emb, 0.1)
-            else:
-                self._update_gallery(self.next_track_id, None, 0.0)
+            is_occluded = (d_idx in occluded_det_indices)
+            
+            pid, state, conf = self.identity_mgr.process_observation(
+                frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, self.camera_id, lambda: self.next_person_id, is_occluded
+            )
+            
+            if pid == self.next_person_id:
+                self.next_person_id += 1
+                
+            new_track.person_id = pid
+            if state in ['CONFIRMED', 'REIDENTIFIED']:
+                new_track.state = 'Confirmed'
+                new_track.hits = 5
                 
             self.tracks.append(new_track)
             matched_tracks.append(new_track)
             
-            fused_conf = 0.4 * det_score + 0.1 * 0.1
+            final_mapped_ids[d_idx] = pid
+            final_mapped_states[d_idx] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] else 'Tentative'
+            final_mapped_confs[d_idx] = float(conf)
             
-            final_mapped_ids[d_idx] = self.next_track_id
-            final_mapped_states[d_idx] = 'Tentative'
-            final_mapped_confs[d_idx] = float(fused_conf)
-            self.next_track_id += 1
+        # Post-match offline duplicate resolving
+        active_pids = [t.person_id for t in self.tracks if t.time_since_update == 0 and t.person_id is not None]
+        self.worker_pool.submit_task(self._resolve_duplicates_task, active_pids)
             
         # Age unmatched tracks
         for track in self.tracks:
             if track not in matched_tracks:
                 track.time_since_update += 1
                 
-        # Spurious/tentative tracks get pruned immediately if not updated in this frame
+        # Prune inactive tracks from the active list if they are inactive for > 150 frames (5 seconds)
+        # to prevent memory build-up and CPU overhead, while keeping them in the global gallery for max_age.
         self.tracks = [
             t for t in self.tracks 
-            if (t.state == 'Confirmed' and t.time_since_update <= self.max_age) 
+            if (t.state == 'Confirmed' and t.time_since_update <= 150) 
             or (t.state == 'Tentative' and t.time_since_update == 0)
         ]
+        
+        # Clean up old gallery entries to prevent infinite memory growth (convert max_age frames to seconds at 30 FPS)
+        now = datetime.now()
+        max_age_sec = self.max_age / 30.0
+        self.global_gallery = {
+            pid: entry for pid, entry in self.global_gallery.items()
+            if (now - entry['last_seen']).total_seconds() <= max_age_sec
+        }
         
         # 6. Filter Output: Only Confirmed tracks are sent downstream (probation mechanism)
         confirmed_mask = np.array([final_mapped_states[i] == 'Confirmed' for i in range(num_dets)], dtype=bool)
@@ -1609,10 +1631,11 @@ def start_area_count_demo():
                                         db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                         
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
-                    active_track_ids = {track.track_id for track in tracker.tracks}
+                    active_track_ids = {track.person_id for track in tracker.tracks if track.person_id is not None}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_last_trigger = {tid: t_val for tid, t_val in track_last_trigger.items() if tid in active_track_ids}
                     track_start_side = {tid: s_val for tid, s_val in track_start_side.items() if tid in active_track_ids}
+                    
                 else:
                     # Non-zones mode: track movement direction horizontally (right to left is IN, left to right is OUT) and vertically (top to bottom is IN, bottom to top is OUT)
                     for idx, (box, _, _, t) in enumerate(detections):
@@ -1703,7 +1726,7 @@ def start_area_count_demo():
                                 db_queue.put(("update_hourly", (camera_id, current_date, current_hour, hourly_in_count, hourly_out_count, peak_occupancy, avg_occ)))
                                 
                     # Clean up tracked histories for aged-out tracks to prevent memory leak
-                    active_track_ids = {track.track_id for track in tracker.tracks}
+                    active_track_ids = {track.person_id for track in tracker.tracks if track.person_id is not None}
                     track_last_center = {tid: pt for tid, pt in track_last_center.items() if tid in active_track_ids}
                     track_start_x = {tid: x_val for tid, x_val in track_start_x.items() if tid in active_track_ids}
                     track_start_y = {tid: y_val for tid, y_val in track_start_y.items() if tid in active_track_ids}
