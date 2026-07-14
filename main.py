@@ -35,6 +35,10 @@ class PipelineRunner:
             print("Error: Could not open camera")
             return
             
+        # Force a specific resolution to prevent buffer size mismatches (the "reshape" error)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            
         print("[*] Streaming started. Warming up camera...")
         
         # Cameras on Raspberry Pi often take a few seconds to warm up and return empty frames initially
