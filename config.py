@@ -1,0 +1,25 @@
+import os
+
+# Camera
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 30
+
+# Detection & Tracking
+DETECTION_CONFIDENCE = 0.5
+TRACKING_MAX_AGE = 30
+TRACKING_MIN_HITS = 3
+
+# Identity Management
+FACE_MATCH_THRESHOLD = 0.6
+BODY_MATCH_THRESHOLD = 0.6
+FUSION_MATCH_THRESHOLD = 0.6
+IDENTITY_TIMEOUT_SEC = 300  # 5 minutes
+
+# Qdrant Database
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+
+# Quality Thresholds
+MIN_FACE_QUALITY = 0.5
+MIN_BODY_QUALITY = 0.5
