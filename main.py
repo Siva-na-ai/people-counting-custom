@@ -106,4 +106,4 @@ class PipelineRunner:
 
 if __name__ == "__main__":
     runner = PipelineRunner()
-    runner.run(1)
+    runner.run(0)
