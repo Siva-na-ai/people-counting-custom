@@ -106,5 +106,4 @@ class PipelineRunner:
 
 if __name__ == "__main__":
     runner = PipelineRunner()
-    # Replace 0 with video file path or RTSP stream if needed
-    runner.run(0)
+    runner.run(1)
