@@ -963,8 +963,8 @@ def get_args():
     parser.add_argument(
         "--reid-model-path",
         type=str,
-        default="~/models/repvgg_a0_person_reid_512.hef",
-        help="Path to compiled ReID HEF model (default: ~/models/repvgg_a0_person_reid_512.hef)"
+        default="/home/assimilate/models/repvgg_a0_person_reid_512.hef",
+        help="Path to compiled ReID HEF model (default: /home/assimilate/models/repvgg_a0_person_reid_512.hef)"
     )
     parser.add_argument(
         "--w-iou",

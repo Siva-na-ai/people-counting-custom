@@ -4,9 +4,9 @@ import os
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 
 # Model Paths
-REPVGG_HEF_PATH = os.path.expanduser(os.getenv("REPVGG_HEF_PATH", "~/models/repvgg_a0_person_reid_512.hef"))
-SCRFD_HEF_PATH = os.path.expanduser(os.getenv("SCRFD_HEF_PATH", "~/models/scrfd_2.5g.hef"))
-ARCFACE_HEF_PATH = os.path.expanduser(os.getenv("ARCFACE_HEF_PATH", "~/models/arcface_mobilefacenet_h8l.hef"))
+REPVGG_HEF_PATH = os.path.expanduser(os.getenv("REPVGG_HEF_PATH", "/home/assimilate/models/repvgg_a0_person_reid_512.hef"))
+SCRFD_HEF_PATH = os.path.expanduser(os.getenv("SCRFD_HEF_PATH", "/home/assimilate/models/scrfd_2.5g.hef"))
+ARCFACE_HEF_PATH = os.path.expanduser(os.getenv("ARCFACE_HEF_PATH", "/home/assimilate/models/arcface_mobilefacenet_h8l.hef"))
 
 # Tracker settings
 MAX_AGE = 900
