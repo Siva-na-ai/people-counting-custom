@@ -4,8 +4,9 @@ from qdrant_client.http.models import Distance, VectorParams
 import uuid
 
 class QdrantIdentityClient:
-    def __init__(self, host="localhost", port=6333):
-        self.client = QdrantClient(host=host, port=port)
+    def __init__(self, path="qdrant_local_db"):
+        # By providing a path, Qdrant runs entirely locally without needing Docker!
+        self.client = QdrantClient(path=path)
         self.face_collection = "face_embeddings"
         self.body_collection = "body_embeddings"
         

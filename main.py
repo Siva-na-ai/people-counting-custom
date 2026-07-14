@@ -18,8 +18,8 @@ class PipelineRunner:
         self.face_rec = FaceRecognition()
         self.quality = EmbeddingQuality()
         
-        print("[*] Initializing Identity System...")
-        self.qdrant = QdrantIdentityClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
+        print("[*] Initializing Identity System (Local Qdrant Mode)...")
+        self.qdrant = QdrantIdentityClient(path="qdrant_local_db")
         self.id_manager = IdentityManager(self.qdrant)
         self.tracker = Tracker(max_age=config.TRACKING_MAX_AGE, min_hits=config.TRACKING_MIN_HITS)
         
