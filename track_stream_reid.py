@@ -880,7 +880,7 @@ class BoTSORTTracker:
         ]
         
         # 6. Filter Output: Only Confirmed tracks are sent downstream (probation mechanism)
-        confirmed_mask = np.array([final_mapped_states[i] == 'Confirmed' for i in range(num_dets)])
+        confirmed_mask = np.array([final_mapped_states[i] == 'Confirmed' for i in range(num_dets)], dtype=bool)
         confirmed_indices = [i for i in range(num_dets) if confirmed_mask[i]]
         
         # Build tracker IDs where tentative are represented as -1 (or filtered out below)
