@@ -57,7 +57,8 @@ class PipelineRunner:
         self.camera_id = "cam_01"
         
     def run(self, source=0):
-        if isinstance(source, int) and os.path.exists("/usr/bin/libcamera-vid"):
+        import shutil
+        if isinstance(source, int) and shutil.which("libcamera-vid"):
             print("[*] Raspberry Pi Detected: Using native LibcameraReader!")
             cap = LibcameraReader(width=640, height=480, fps=15)
         else:
