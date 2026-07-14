@@ -588,6 +588,9 @@ class BoTSORTTracker:
         class_ids = [class_ids_raw[i] for i in final_valid_indices]
         num_dets = len(final_valid_indices)
         
+        if not is_numpy:
+            detections = detections[final_valid_indices]
+            
         # 2. Pre-extract embeddings and calculate crop quality metrics
         det_embeddings = []
         det_qualities = []
