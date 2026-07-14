@@ -289,7 +289,7 @@ class HTTPStreamer:
 
 
 class Track:
-    def __init__(self, track_id: int, box: np.ndarray, embedding: np.ndarray, score: float, class_id: int):
+    def __init__(self, track_id: int, box: np.ndarray, embedding: np.ndarray, score: float, class_id: int, state: str = 'Tentative'):
         self.track_id = track_id
         self.box = box
         self.score = score
@@ -299,6 +299,8 @@ class Track:
         self.time_since_update = 0
         self.update_count = 0
         self.history = [] # list of (cx, cy) center points
+        self.state = state
+        self.hits = 1
 
     def add_embedding(self, embedding: np.ndarray, quality_score: float):
         if embedding is None:
@@ -368,29 +370,115 @@ class BoTSORTTracker:
             return None
         return self.reid.infer(crop)
 
+    def _validate_bbox(self, box: np.ndarray, img_h: int, img_w: int) -> bool:
+        if box is None or len(box) < 4:
+            return False
+            
+        if any(coord > 2.0 for coord in box):
+            xmin, ymin, xmax, ymax = box
+        else:
+            xmin = box[0] * img_w
+            ymin = box[1] * img_h
+            xmax = box[2] * img_w
+            ymax = box[3] * img_h
+            
+        box_w = xmax - xmin
+        box_h = ymax - ymin
+        
+        if box_w <= 0 or box_h <= 0 or xmin >= xmax or ymin >= ymax:
+            return False
+            
+        # 1. Aspect ratio validation (persons are vertical, typically aspect ratio height/width >= 1.1 and <= 4.5)
+        aspect_ratio = box_h / box_w
+        if aspect_ratio < 1.1: # Reject horizontal or too-square boxes (shadows, reflections, bags, head-only)
+            return False
+        if aspect_ratio > 4.5: # Reject extremely thin vertical lines (poles, shelf edges)
+            return False
+            
+        # 2. Scale check (reject tiny boxes)
+        if box_w < 20 or box_h < 50:
+            return False
+            
+        # 3. Visibility check (ensure box is mostly inside image frame)
+        inter_xmin = max(0, xmin)
+        inter_ymin = max(0, ymin)
+        inter_xmax = min(img_w, xmax)
+        inter_ymax = min(img_h, ymax)
+        
+        inter_area = max(0.0, inter_xmax - inter_xmin) * max(0.0, inter_ymax - inter_ymin)
+        box_area = box_w * box_h
+        visible_pct = inter_area / box_area if box_area > 0 else 0.0
+        
+        if visible_pct < 0.65:
+            return False
+            
+        return True
+
     def _get_crop_quality(self, crop: np.ndarray, confidence: float) -> tuple[bool, float]:
         if crop is None or crop.size == 0:
             return False, 0.0
         h, w, _ = crop.shape
-        # Reject tiny detections
-        if w < 32 or h < 64:
+        
+        # Scale check for ReID quality
+        if w < 30 or h < 60:
             return False, 0.0
-        # Reject low-confidence detections
+            
+        # Low confidence check
         if confidence < 0.65:
             return False, 0.0
             
-        # Reject blurred crops using Laplacian variance
+        # Sharpness/Blur check via Laplacian variance
         try:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         except Exception:
             return False, 0.0
             
-        if lap_var < 100.0:
+        if lap_var < 80.0:
             return False, 0.0
             
-        quality_score = float(confidence * lap_var)
+        # Lighting check (mean brightness)
+        mean_brightness = np.mean(gray)
+        if mean_brightness < 30.0 or mean_brightness > 225.0:
+            return False, 0.0
+            
+        quality_score = float(confidence * lap_var * (w * h) / 10000.0)
         return True, quality_score
+
+    def _run_nms(self, boxes: list, scores: list, iou_threshold: float = 0.45) -> list[int]:
+        if len(boxes) == 0:
+            return []
+            
+        boxes_arr = np.array(boxes)
+        scores_arr = np.array(scores)
+        
+        x1 = boxes_arr[:, 0]
+        y1 = boxes_arr[:, 1]
+        x2 = boxes_arr[:, 2]
+        y2 = boxes_arr[:, 3]
+        
+        areas = (x2 - x1) * (y2 - y1)
+        order = scores_arr.argsort()[::-1]
+        
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            inter = w * h
+            
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            inds = np.where(ovr <= iou_threshold)[0]
+            order = order[inds + 1]
+            
+        return keep
 
     def _update_gallery(self, person_id: int, embedding: np.ndarray, quality_score: float):
         if person_id not in self.global_gallery:
@@ -441,16 +529,16 @@ class BoTSORTTracker:
                 return np.zeros(0, dtype=new_dtype)
             return detections
             
-        boxes = []
-        scores = []
-        class_ids = []
+        boxes_raw = []
+        scores_raw = []
+        class_ids_raw = []
         
         is_numpy = isinstance(detections, np.ndarray)
         
         if not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
-            boxes = detections.coords
-            scores = detections.confidence
-            class_ids = detections.class_id
+            boxes_raw = detections.coords
+            scores_raw = detections.confidence
+            class_ids_raw = detections.class_id
         elif is_numpy and detections.dtype.names is not None:
             names = detections.dtype.names
             box_field = 'box' if 'box' in names else (names[0] if len(names) > 0 else None)
@@ -458,17 +546,49 @@ class BoTSORTTracker:
             class_field = 'class_id' if 'class_id' in names else (names[2] if len(names) > 2 else None)
             
             for d_idx in range(num_dets):
-                boxes.append(detections[d_idx][box_field] if box_field else detections[d_idx][0])
-                scores.append(detections[d_idx][score_field] if score_field else detections[d_idx][1])
-                class_ids.append(detections[d_idx][class_field] if class_field else detections[d_idx][2])
+                boxes_raw.append(detections[d_idx][box_field] if box_field else detections[d_idx][0])
+                scores_raw.append(detections[d_idx][score_field] if score_field else detections[d_idx][1])
+                class_ids_raw.append(detections[d_idx][class_field] if class_field else detections[d_idx][2])
         else:
             for det in detections:
                 det_tuple = tuple(det)
-                boxes.append(det_tuple[0])
-                scores.append(det_tuple[1])
-                class_ids.append(det_tuple[2])
+                boxes_raw.append(det_tuple[0])
+                scores_raw.append(det_tuple[1])
+                class_ids_raw.append(det_tuple[2])
                 
-        # 1. Pre-extract embeddings and calculate crop quality metrics
+        # 1. Validation & CPU NMS Filtering to eliminate false person detections & duplicate IDs
+        img_h, img_w, _ = frame_image.shape
+        valid_indices = []
+        for i in range(num_dets):
+            det_box = boxes_raw[i]
+            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
+                det_box = det_box.flatten()
+            if self._validate_bbox(det_box, img_h, img_w):
+                valid_indices.append(i)
+                
+        if len(valid_indices) > 0:
+            nms_boxes = []
+            for idx in valid_indices:
+                b = boxes_raw[idx]
+                if isinstance(b, np.ndarray) and b.ndim > 1:
+                    b = b.flatten()
+                if any(coord > 2.0 for coord in b):
+                    nms_boxes.append(b)
+                else:
+                    nms_boxes.append([b[0]*img_w, b[1]*img_h, b[2]*img_w, b[3]*img_h])
+            nms_scores = [float(scores_raw[idx].item()) if isinstance(scores_raw[idx], np.ndarray) else float(scores_raw[idx]) for idx in valid_indices]
+            
+            keep_sub_indices = self._run_nms(nms_boxes, nms_scores, iou_threshold=0.45)
+            final_valid_indices = [valid_indices[idx] for idx in keep_sub_indices]
+        else:
+            final_valid_indices = []
+            
+        boxes = [boxes_raw[i] for i in final_valid_indices]
+        scores = [scores_raw[i] for i in final_valid_indices]
+        class_ids = [class_ids_raw[i] for i in final_valid_indices]
+        num_dets = len(final_valid_indices)
+        
+        # 2. Pre-extract embeddings and calculate crop quality metrics
         det_embeddings = []
         det_qualities = []
         
@@ -478,9 +598,12 @@ class BoTSORTTracker:
                 det_box = det_box.flatten()
             crop = self.get_crop(frame_image, det_box)
             
-            emb = self.extract_embedding(crop)
             is_valid, quality = self._get_crop_quality(crop, float(scores[d_idx]))
-            
+            if is_valid:
+                emb = self.extract_embedding(crop)
+            else:
+                emb = None
+                
             det_embeddings.append(emb)
             det_qualities.append((is_valid, quality))
             
@@ -489,8 +612,22 @@ class BoTSORTTracker:
         matched_det_indices = []
         
         final_mapped_ids = [0] * num_dets
+        final_mapped_states = ['Tentative'] * num_dets
+        final_mapped_confs = [0.0] * num_dets
         
-        # 2. Hungarian matching on active and recently lost tracks
+        # Identify occluded tracks to prevent ID swaps
+        occluded_tracks = set()
+        for i, t1 in enumerate(self.tracks):
+            if t1.time_since_update > 0:
+                continue
+            for j, t2 in enumerate(self.tracks):
+                if i != j and t2.time_since_update == 0:
+                    t1_box = t1.box.flatten() if isinstance(t1.box, np.ndarray) else t1.box
+                    t2_box = t2.box.flatten() if isinstance(t2.box, np.ndarray) else t2.box
+                    if compute_iou(t1_box, t2_box) > 0.20:
+                        occluded_tracks.add(t1.track_id)
+                        
+        # 3. Hungarian matching on active and recently lost tracks
         if num_tracks > 0:
             cost_matrix = np.zeros((num_tracks, num_dets))
             
@@ -513,6 +650,17 @@ class BoTSORTTracker:
                 track_h = track.box[3] - track.box[1]
                 diag = np.sqrt(track_w**2 + track_h**2)
                 
+                # Occlusion-aware weight shift
+                is_occluded = track.track_id in occluded_tracks
+                if is_occluded:
+                    w_iou = 0.1
+                    w_app = 0.6
+                    w_motion = 0.3
+                else:
+                    w_iou = self.w_iou
+                    w_app = self.w_app
+                    w_motion = self.w_motion
+                    
                 for d_idx in range(num_dets):
                     det_box = boxes[d_idx]
                     if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
@@ -540,17 +688,15 @@ class BoTSORTTracker:
                         has_app = False
                         
                     if track.time_since_update <= 3:
-                        # Frame-to-frame matching combining IoU, Appearance, and Motion
                         if has_app:
-                            cost = self.w_iou * C_iou + self.w_app * C_app + self.w_motion * C_motion
+                            cost = w_iou * C_iou + w_app * C_app + w_motion * C_motion
                         else:
-                            total_w = self.w_iou + self.w_motion
+                            total_w = w_iou + w_motion
                             if total_w > 0:
-                                cost = (self.w_iou / total_w) * C_iou + (self.w_motion / total_w) * C_motion
+                                cost = (w_iou / total_w) * C_iou + (w_motion / total_w) * C_motion
                             else:
                                 cost = C_iou
                     else:
-                        # Long-lost track matching (ReID-only)
                         if has_app:
                             cost = C_app
                             if max_sim < self.reid_threshold:
@@ -570,38 +716,58 @@ class BoTSORTTracker:
                     track = self.tracks[r]
                     matched_tracks.append(track)
                     matched_det_indices.append(c)
-                    final_mapped_ids[c] = track.track_id
                     
-        # Update matched tracks
-        for track, d_idx in zip(matched_tracks, matched_det_indices):
-            det_box = boxes[d_idx]
-            if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
-                det_box = det_box.flatten()
-            det_score = float(scores[d_idx].item()) if isinstance(scores[d_idx], np.ndarray) else float(scores[d_idx])
-            det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
-            
-            track.box = det_box
-            track.score = det_score
-            track.class_id = det_class
-            track.time_since_update = 0
-            
-            cx = (det_box[0] + det_box[2]) / 2.0
-            cy = (det_box[1] + det_box[3]) / 2.0
-            track.history.append((cx, cy))
-            if len(track.history) > 10:
-                track.history.pop(0)
-                
-            det_emb = det_embeddings[d_idx]
-            is_valid, quality = det_qualities[d_idx]
-            if is_valid and det_emb is not None:
-                track.add_embedding(det_emb, quality)
-                self._update_gallery(track.track_id, det_emb, quality)
-            else:
-                self._update_gallery(track.track_id, None, 0.0)
-                
-            track.update_count += 1
-            
-        # 3. Re-identify remaining unmatched detections via Global ReID Gallery
+                    track.box = boxes[c]
+                    track.score = float(scores[c].item()) if isinstance(scores[c], np.ndarray) else float(scores[c])
+                    track.class_id = int(class_ids[c].item()) if isinstance(class_ids[c], np.ndarray) else int(class_ids[c])
+                    track.time_since_update = 0
+                    track.hits += 1
+                    
+                    # Probation state promotion (Tentative -> Confirmed)
+                    if track.state == 'Tentative' and track.hits >= 3:
+                        track.state = 'Confirmed'
+                        
+                    cx = (track.box[0] + track.box[2]) / 2.0
+                    cy = (track.box[1] + track.box[3]) / 2.0
+                    track.history.append((cx, cy))
+                    if len(track.history) > 10:
+                        track.history.pop(0)
+                        
+                    det_emb = det_embeddings[c]
+                    is_valid, quality = det_qualities[c]
+                    if is_valid and det_emb is not None:
+                        track.add_embedding(det_emb, quality)
+                        self._update_gallery(track.track_id, det_emb, quality)
+                    else:
+                        self._update_gallery(track.track_id, None, 0.0)
+                        
+                    track.update_count += 1
+                    
+                    # Confidence Fusion
+                    det_conf = track.score
+                    app_sim = 0.0
+                    if len(track.embeddings) > 0 and det_emb is not None:
+                        app_sim = max([np.dot(det_emb, stored_emb) for stored_emb in track.embeddings])
+                    track_w = track.box[2] - track.box[0]
+                    track_h = track.box[3] - track.box[1]
+                    diag = np.sqrt(track_w**2 + track_h**2)
+                    if len(track.history) >= 2:
+                        c_last = track.history[-1]
+                        c_prev = track.history[-2]
+                        dist = np.sqrt((c_last[0] - c_prev[0])**2 + (c_last[1] - c_prev[1])**2)
+                        dist_norm = dist / diag if diag > 0 else dist
+                        motion_sim = np.exp(-2.0 * dist_norm)
+                    else:
+                        motion_sim = 1.0
+                    age_factor = min(1.0, track.hits / 10.0)
+                    
+                    fused_conf = 0.4 * det_conf + 0.3 * app_sim + 0.2 * motion_sim + 0.1 * age_factor
+                    
+                    final_mapped_ids[c] = track.track_id
+                    final_mapped_states[c] = track.state
+                    final_mapped_confs[c] = float(fused_conf)
+                    
+        # 4. Re-identify remaining unmatched detections via Global ReID Gallery
         unmatched_det_indices = [d for d in range(num_dets) if d not in matched_det_indices]
         valid_unmatched_det_indices = [d for d in unmatched_det_indices if det_embeddings[d] is not None]
         
@@ -637,10 +803,12 @@ class BoTSORTTracker:
                     det_emb = det_embeddings[d_idx]
                     is_valid, quality = det_qualities[d_idx]
                     
-                    new_track = Track(pid, det_box, None, det_score, det_class)
+                    # Returning person track starts immediately as Confirmed
+                    new_track = Track(pid, det_box, None, det_score, det_class, state='Confirmed')
                     entry = self.global_gallery[pid]
                     new_track.embeddings = list(entry['embeddings'])
                     new_track.quality_scores = list(entry['quality_scores'])
+                    new_track.hits = entry['hit_count'] + 1
                     
                     cx = (det_box[0] + det_box[2]) / 2.0
                     cy = (det_box[1] + det_box[3]) / 2.0
@@ -654,10 +822,17 @@ class BoTSORTTracker:
                         
                     self.tracks.append(new_track)
                     matched_tracks.append(new_track)
+                    
+                    app_sim = max([np.dot(det_emb, stored_emb) for stored_emb in new_track.embeddings]) if det_emb is not None else 0.0
+                    age_factor = min(1.0, new_track.hits / 10.0)
+                    fused_conf = 0.4 * det_score + 0.3 * app_sim + 0.2 * 1.0 + 0.1 * age_factor
+                    
                     final_mapped_ids[d_idx] = pid
+                    final_mapped_states[d_idx] = 'Confirmed'
+                    final_mapped_confs[d_idx] = float(fused_conf)
                     unmatched_det_indices.remove(d_idx)
                     
-        # 4. Create new tracks for the remaining unmatched detections
+        # 5. Create new tracks for the remaining unmatched detections (State = Tentative)
         for d_idx in unmatched_det_indices:
             det_box = boxes[d_idx]
             if isinstance(det_box, np.ndarray) and det_box.ndim > 1:
@@ -667,7 +842,7 @@ class BoTSORTTracker:
             det_emb = det_embeddings[d_idx]
             is_valid, quality = det_qualities[d_idx]
             
-            new_track = Track(self.next_track_id, det_box, None, det_score, det_class)
+            new_track = Track(self.next_track_id, det_box, None, det_score, det_class, state='Tentative')
             cx = (det_box[0] + det_box[2]) / 2.0
             cy = (det_box[1] + det_box[3]) / 2.0
             new_track.history.append((cx, cy))
@@ -684,7 +859,12 @@ class BoTSORTTracker:
                 
             self.tracks.append(new_track)
             matched_tracks.append(new_track)
+            
+            fused_conf = 0.4 * det_score + 0.1 * 0.1
+            
             final_mapped_ids[d_idx] = self.next_track_id
+            final_mapped_states[d_idx] = 'Tentative'
+            final_mapped_confs[d_idx] = float(fused_conf)
             self.next_track_id += 1
             
         # Age unmatched tracks
@@ -692,26 +872,39 @@ class BoTSORTTracker:
             if track not in matched_tracks:
                 track.time_since_update += 1
                 
-        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        # Spurious/tentative tracks get pruned immediately if not updated in this frame
+        self.tracks = [
+            t for t in self.tracks 
+            if (t.state == 'Confirmed' and t.time_since_update <= self.max_age) 
+            or (t.state == 'Tentative' and t.time_since_update == 0)
+        ]
         
-        tracker_ids = np.array(final_mapped_ids, dtype=np.int32)
+        # 6. Filter Output: Only Confirmed tracks are sent downstream (probation mechanism)
+        confirmed_mask = np.array([final_mapped_states[i] == 'Confirmed' for i in range(num_dets)])
+        confirmed_indices = [i for i in range(num_dets) if confirmed_mask[i]]
+        
+        # Build tracker IDs where tentative are represented as -1 (or filtered out below)
+        tracker_ids_full = np.array([final_mapped_ids[i] if final_mapped_states[i] == 'Confirmed' else -1 for i in range(num_dets)], dtype=np.int32)
         
         if not is_numpy:
             if hasattr(detections, '_tracker_id'):
-                detections._tracker_id = tracker_ids
+                detections._tracker_id = tracker_ids_full
             if hasattr(detections, 'tracker_id'):
                 try:
-                    detections.tracker_id = tracker_ids
+                    detections.tracker_id = tracker_ids_full
                 except AttributeError:
                     pass
-            return detections
+            # Return custom detections object filtered to confirmed only
+            return detections[confirmed_mask]
         else:
-            tracked_arr = np.zeros(num_dets, dtype=new_dtype)
-            for i in range(num_dets):
-                tracked_arr['box'][i] = boxes[i]
-                tracked_arr['confidence'][i] = scores[i]
-                tracked_arr['class_id'][i] = class_ids[i]
-                tracked_arr['track_id'][i] = final_mapped_ids[i]
+            if len(confirmed_indices) == 0:
+                return np.zeros(0, dtype=new_dtype)
+            tracked_arr = np.zeros(len(confirmed_indices), dtype=new_dtype)
+            for idx, d_idx in enumerate(confirmed_indices):
+                tracked_arr['box'][idx] = boxes[d_idx]
+                tracked_arr['confidence'][idx] = final_mapped_confs[d_idx]
+                tracked_arr['class_id'][idx] = class_ids[d_idx]
+                tracked_arr['track_id'][idx] = final_mapped_ids[d_idx]
             return tracked_arr
 
 
