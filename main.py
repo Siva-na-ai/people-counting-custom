@@ -27,17 +27,35 @@ class PipelineRunner:
         
     def run(self, source=0):
         cap = cv2.VideoCapture(source)
+        # Try V4L2 backend if the default one fails
+        if not cap.isOpened() and isinstance(source, int):
+            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            
         if not cap.isOpened():
             print("Error: Could not open camera")
             return
             
-        print("[*] Streaming started...")
+        print("[*] Streaming started. Warming up camera...")
+        
+        # Cameras on Raspberry Pi often take a few seconds to warm up and return empty frames initially
+        warmup_success = False
+        for _ in range(30):
+            ret, frame = cap.read()
+            if ret:
+                warmup_success = True
+                break
+            time.sleep(0.1)
+            
+        if not warmup_success:
+            print("❌ Error: Camera opened, but failed to read any frames. (Check camera permissions or libcamera settings!)")
+            return
+            
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    print("❌ Error: Failed to read frame from camera. (Is the camera plugged in and accessible?)")
-                    break
+                    print("⚠️ Warning: Frame dropped.")
+                    continue
                     
                 # 1. Detection
                 faces = self.face_detector.detect(frame)
