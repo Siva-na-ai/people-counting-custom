@@ -6,7 +6,7 @@ from face_alignment import FaceAlignment
 from face_recognition import FaceRecognition
 from tracker import Tracker
 from identity_manager import IdentityManager
-from qdrant_client import QdrantIdentityClient
+from qdrant_db import QdrantIdentityClient
 from embedding_quality import EmbeddingQuality
 import config
 
