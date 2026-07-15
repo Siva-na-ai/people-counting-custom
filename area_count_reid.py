@@ -742,6 +742,7 @@ class BoTSORTTracker:
         self.tracks = []
         self.next_track_id = 1
         self.next_person_id = 1
+        self.global_gallery = {}
         
         # Initialize Qdrant and production components
         self.qdrant = QdrantClient()
