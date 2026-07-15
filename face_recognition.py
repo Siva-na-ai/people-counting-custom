@@ -44,13 +44,12 @@ class HailoFaceRecognizer:
             self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
         )
         
-        self.activated_network_group = self.network_group.activate(self.network_group_params)
-        self.activated_network_group.__enter__()
+        self.activated_network_group = None
+        self.pipeline_active = False
         
         self.infer_pipeline = hpf.InferVStreams(
             self.network_group, self.input_vstreams_params, self.output_vstreams_params
         )
-        self.infer_pipeline.__enter__()
         
         # Shape definition
         shape = self.input_vstream_info.shape
@@ -70,6 +69,7 @@ class HailoFaceRecognizer:
         if aligned_face_crop_bgr is None or aligned_face_crop_bgr.size == 0:
             return None
             
+        self._activate_network()
         try:
             # Convert BGR to RGB
             crop_rgb = cv2.cvtColor(aligned_face_crop_bgr, cv2.COLOR_BGR2RGB)
@@ -94,19 +94,43 @@ class HailoFaceRecognizer:
             print(f"[-] Face recognition embedding extraction failed: {e}")
             return None
 
-    def close(self):
-        if hasattr(self, 'infer_pipeline') and self.infer_pipeline:
+    def _activate_network(self):
+        active_group = getattr(self.target, "_active_group", None)
+        if active_group is not self.network_group:
+            if active_group is not None:
+                other_instance = getattr(self.target, "_active_instance", None)
+                if other_instance is not None:
+                    other_instance._deactivate_network()
+            
+            self.activated_network_group = self.network_group.activate(self.network_group_params)
+            self.activated_network_group.__enter__()
+            self.infer_pipeline.__enter__()
+            self.pipeline_active = True
+            
+            self.target._active_group = self.network_group
+            self.target._active_instance = self
+
+    def _deactivate_network(self):
+        if self.pipeline_active:
             try:
                 self.infer_pipeline.__exit__(None, None, None)
             except Exception:
                 pass
-            self.infer_pipeline = None
-        if hasattr(self, 'activated_network_group') and self.activated_network_group:
+            self.pipeline_active = False
+        if self.activated_network_group:
             try:
                 self.activated_network_group.__exit__(None, None, None)
             except Exception:
                 pass
             self.activated_network_group = None
+        if getattr(self.target, "_active_group", None) is self.network_group:
+            self.target._active_group = None
+            self.target._active_instance = None
+
+    def close(self):
+        self._deactivate_network()
+        if hasattr(self, 'infer_pipeline') and self.infer_pipeline:
+            self.infer_pipeline = None
         if hasattr(self, 'target') and self.target:
             if hasattr(self, 'owns_target') and self.owns_target:
                 try:
