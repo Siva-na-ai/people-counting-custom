@@ -6,6 +6,12 @@ import logging
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 import numpy as np
+from typing import Optional
+
+try:
+    import hailo_platform as hpf
+except ImportError:
+    hpf = None
 
 # Import custom pipeline modules
 import config
@@ -56,9 +62,10 @@ class PipelineRunner:
         
         # 4. Load Hailo HEF Engines
         logger.info("Initializing Hailo-8L accelerators...")
-        self.body_reid = HailoReID(hef_path=config.REPVGG_HEF_PATH)
-        self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH)
-        self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH)
+        self.shared_target = hpf.VDevice() if hpf is not None else None
+        self.body_reid = HailoReID(hef_path=config.REPVGG_HEF_PATH, target=self.shared_target)
+        self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH, target=self.shared_target)
+        self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH, target=self.shared_target)
         
         # 5. Core Tracker
         self.tracker = BoTSORTTracker(max_age=config.MAX_AGE)
@@ -171,3 +178,9 @@ class PipelineRunner:
         self.body_reid.close()
         self.face_det.close()
         self.face_rec.close()
+        if hasattr(self, 'shared_target') and self.shared_target:
+            try:
+                self.shared_target.close()
+            except Exception:
+                pass
+            self.shared_target = None

@@ -15,6 +15,7 @@
 #
 
 import os
+from typing import Optional
 import cv2
 import numpy as np
 import subprocess
@@ -36,7 +37,7 @@ class HailoReID:
     """
     Class managing ReID inference on Hailo-8L using a compiled HEF model.
     """
-    def __init__(self, hef_path: str):
+    def __init__(self, hef_path: str, target: Optional[hpf.VDevice] = None):
         self.hef_path = os.path.expanduser(hef_path)
         if not os.path.exists(self.hef_path):
             raise FileNotFoundError(f"Hailo ReID HEF model not found at {self.hef_path}")
@@ -47,7 +48,8 @@ class HailoReID:
             )
             
         self.hef = hpf.HEF(self.hef_path)
-        self.target = hpf.VDevice()
+        self.owns_target = (target is None)
+        self.target = target if target is not None else hpf.VDevice()
         
         # Configure network group
         self.configure_params = hpf.ConfigureParams.create_from_hef(
@@ -131,10 +133,11 @@ class HailoReID:
                 pass
             self.activated_network_group = None
         if hasattr(self, 'target') and self.target:
-            try:
-                self.target.close()
-            except Exception:
-                pass
+            if hasattr(self, 'owns_target') and self.owns_target:
+                try:
+                    self.target.close()
+                except Exception:
+                    pass
             self.target = None
 
     def __del__(self):
@@ -362,8 +365,11 @@ class BoTSORTTracker:
         self.gating_threshold = 0.70
         self.camera_id = camera_id
         
+        # Initialize Shared Hailo target if available
+        self.shared_target = hpf.VDevice() if hpf is not None else None
+        
         # Initialize ReID engine (body)
-        self.reid = HailoReID(hef_path=reid_model_path)
+        self.reid = HailoReID(hef_path=reid_model_path, target=self.shared_target)
         self.tracks = []
         self.next_track_id = 1
         self.next_person_id = 1
@@ -384,8 +390,8 @@ class BoTSORTTracker:
         self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
         
         # Load Hailo Face engines
-        self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH)
-        self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH)
+        self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH, target=self.shared_target)
+        self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH, target=self.shared_target)
         
         # Pipeline Coordinator
         self.identity_mgr = IdentityManager(
@@ -400,6 +406,12 @@ class BoTSORTTracker:
             self.face_det.close()
         if hasattr(self, 'face_rec') and self.face_rec:
             self.face_rec.close()
+        if hasattr(self, 'shared_target') and self.shared_target:
+            try:
+                self.shared_target.close()
+            except Exception:
+                pass
+            self.shared_target = None
         if hasattr(self, 'worker_pool') and self.worker_pool:
             self.worker_pool.stop()
             

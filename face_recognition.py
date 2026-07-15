@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import config
+from typing import Optional
 
 try:
     import hailo_platform as hpf
@@ -12,7 +13,7 @@ class HailoFaceRecognizer:
     """
     Hailo-accelerated ArcFace feature extractor for facial recognition.
     """
-    def __init__(self, hef_path: str = config.ARCFACE_HEF_PATH):
+    def __init__(self, hef_path: str = config.ARCFACE_HEF_PATH, target: Optional[hpf.VDevice] = None):
         self.hef_path = os.path.expanduser(hef_path)
         if not os.path.exists(self.hef_path):
             raise FileNotFoundError(f"ArcFace HEF model not found at {self.hef_path}")
@@ -21,7 +22,8 @@ class HailoFaceRecognizer:
             raise ImportError("hailo_platform is not installed.")
             
         self.hef = hpf.HEF(self.hef_path)
-        self.target = hpf.VDevice()
+        self.owns_target = (target is None)
+        self.target = target if target is not None else hpf.VDevice()
         
         # Configure network group
         self.configure_params = hpf.ConfigureParams.create_from_hef(
@@ -106,10 +108,11 @@ class HailoFaceRecognizer:
                 pass
             self.activated_network_group = None
         if hasattr(self, 'target') and self.target:
-            try:
-                self.target.close()
-            except Exception:
-                pass
+            if hasattr(self, 'owns_target') and self.owns_target:
+                try:
+                    self.target.close()
+                except Exception:
+                    pass
             self.target = None
 
     def __del__(self):
