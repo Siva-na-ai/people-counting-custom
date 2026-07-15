@@ -15,13 +15,13 @@ MAX_AGE = 900
 CONFIRMATION_THRESHOLD = 5  # Hits required to confirm a track
 
 # Embedding Quality Thresholds (Production Settings)
-FACE_MIN_SIZE = 60          # Minimum face bounding box width/height (Production: 60px)
-FACE_BLUR_THRESHOLD = 80.0  # Minimum Laplacian variance for sharpness (Production: 80.0)
+FACE_MIN_SIZE = 45          # Minimum face bounding box width/height
+FACE_BLUR_THRESHOLD = 50.0  # Minimum Laplacian variance for sharpness
 FACE_BRIGHTNESS_MIN = 40    # Minimum average pixel brightness
 FACE_BRIGHTNESS_MAX = 220   # Maximum average pixel brightness
-FACE_ANGLE_YAW_MAX = 20.0   # Maximum yaw angle (Production: 20.0)
-FACE_ANGLE_PITCH_MAX = 20.0 # Maximum pitch angle (Production: 20.0)
-FACE_ANGLE_ROLL_MAX = 15.0  # Maximum roll angle (Production: 15.0)
+FACE_ANGLE_YAW_MAX = 35.0   # Maximum yaw angle
+FACE_ANGLE_PITCH_MAX = 30.0 # Maximum pitch angle
+FACE_ANGLE_ROLL_MAX = 20.0  # Maximum roll angle
 
 BODY_BLUR_THRESHOLD = 0.0   # Disable blur check for body ReID (highly robust to blur)
 BODY_MIN_SIZE = 64          # Minimum body size
