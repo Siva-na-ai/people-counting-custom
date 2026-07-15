@@ -88,10 +88,11 @@ class IdentityManager:
         if not should_infer and (cached_face is not None or cached_body is not None):
             face_emb = cached_face
             body_emb = cached_body
-        else:
             # 2. RUN BODY PIPELINE (RepVGG + Quality check)
             if body_ok:
                 body_emb = self.repvgg.infer(person_crop)
+            else:
+                logger.info(f"[IdentityManager] Body crop quality check failed (size/blur) for track #{track_id}. Skipping ReID inference.")
                 
             # 3. RUN FACE PIPELINE (SCRFD -> Align -> ArcFace -> Quality check)
             # Run SCRFD Face Detector inside person crop

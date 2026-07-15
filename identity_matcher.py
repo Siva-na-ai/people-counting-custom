@@ -34,9 +34,11 @@ class IdentityMatcher:
         # 1. Search vector DB (Top-5 Face & Top-5 Body)
         if face_emb is not None:
             face_hits = self.qdrant.search_similar("face_embeddings", face_emb.tolist(), limit=5)
+            logger.info(f"[IdentityMatcher] Face search hits: {[(hit['payload']['person_id'], round(hit['score'], 4)) for hit in face_hits]}")
             
         if body_emb is not None:
             body_hits = self.qdrant.search_similar("body_embeddings", body_emb.tolist(), limit=5)
+            logger.info(f"[IdentityMatcher] Body search hits: {[(hit['payload']['person_id'], round(hit['score'], 4)) for hit in body_hits]}")
             
         # 2. Priority check: High confidence face override (similarity >= 0.90)
         best_face_pid = None

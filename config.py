@@ -20,7 +20,7 @@ FACE_BRIGHTNESS_MAX = 220   # Maximum average pixel brightness
 FACE_ANGLE_YAW_MAX = 45.0   # Maximum yaw angle
 FACE_ANGLE_PITCH_MAX = 35.0 # Maximum pitch angle
 
-BODY_BLUR_THRESHOLD = 25.0  # Minimum Laplacian variance for body sharpness
+BODY_BLUR_THRESHOLD = 0.0   # Disable blur check for body ReID (highly robust to blur)
 BODY_MIN_SIZE = 64          # Minimum body size
 
 # Gallery Limits
@@ -28,8 +28,8 @@ FACE_GALLERY_MAX = 20
 BODY_GALLERY_MAX = 30
 
 # Similarity Thresholds
-REID_THRESHOLD_FACE = 0.65  # Threshold for ArcFace cosine similarity match
-REID_THRESHOLD_BODY = 0.70  # Threshold for RepVGG body similarity match
+REID_THRESHOLD_FACE = 0.55  # Threshold for ArcFace cosine similarity match
+REID_THRESHOLD_BODY = 0.55  # Threshold for RepVGG body similarity match
 
 # Motion constraints (scaled by object body diagonal size)
 MAX_MOTION_DIAGS = 3.0      # Teleport check limit for active tracks (multiplied by diag)
