@@ -124,7 +124,7 @@ class IdentityManager:
             self.cache.put(track_id, face_emb, body_emb, det_box, body_quality, det_score)
 
         # 5. Call FusionEngine to resolve final Person ID
-         person_id, confidence = self.fusion.resolve_identity(
+        person_id, confidence = self.fusion.resolve_identity(
             track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h, next_person_id_callback
         )
         
