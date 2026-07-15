@@ -1863,7 +1863,16 @@ def start_area_count_demo():
                     if t > 0:
                         labels.append(f"#Person {t} person: {s:0.2f}")
                     else:
-                        labels.append(f"#Track {abs(t)} person: {s:0.2f}")
+                        # Check track identity_state for face quality feedback
+                        track_obj = None
+                        for tk in tracker.tracks:
+                            if tk.track_id == abs(t):
+                                track_obj = tk
+                                break
+                        if track_obj is not None and track_obj.identity_state == 'FACE_VISIBLE':
+                            labels.append(f"#Track {abs(t)} (face not proper) person: {s:0.2f}")
+                        else:
+                            labels.append(f"#Track {abs(t)} person: {s:0.2f}")
 
                 # Draw bounding boxes and labels using OpenCV
                 for idx, (box, s, c, t) in enumerate(detections):
