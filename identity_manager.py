@@ -124,10 +124,13 @@ class IdentityManager:
             self.cache.put(track_id, face_emb, body_emb, det_box, body_quality, det_score)
 
         # 5. Call FusionEngine to resolve final Person ID
-        person_id, confidence = self.fusion.resolve_identity(
+         person_id, confidence = self.fusion.resolve_identity(
             track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h, next_person_id_callback
         )
         
+        if person_id is None:
+            return None, "Tentative", 0.0
+            
         # 6. Update Person Registry Metadata and state machine
         hits = 5  # Typical hits count, we get this updated by the registry
         self.registry.update_person(

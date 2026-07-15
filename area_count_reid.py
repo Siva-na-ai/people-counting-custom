@@ -1220,7 +1220,7 @@ class BoTSORTTracker:
                         
                     track.person_id = pid
                     
-                    final_mapped_ids[c] = track.person_id
+                    final_mapped_ids[c] = track.person_id if track.person_id is not None else -int(track.track_id)
                     final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
                     final_mapped_confs[c] = float(conf)
                     
@@ -1257,7 +1257,7 @@ class BoTSORTTracker:
             self.tracks.append(new_track)
             matched_tracks.append(new_track)
             
-            final_mapped_ids[d_idx] = pid
+            final_mapped_ids[d_idx] = pid if pid is not None else -int(new_track.track_id)
             final_mapped_states[d_idx] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] else 'Tentative'
             final_mapped_confs[d_idx] = float(conf)
             
@@ -1790,7 +1790,10 @@ def start_area_count_demo():
                 #-----Display Annotations-----
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
-                    labels.append(f"#{t} {model.labels[c]}: {s:0.2f}")
+                    if t > 0:
+                        labels.append(f"#Person {t} {model.labels[c]}: {s:0.2f}")
+                    else:
+                        labels.append(f"#Track {abs(t)} {model.labels[c]}: {s:0.2f}")
 
                 frame.image = annotator.annotate_boxes(
                     frame=frame,
