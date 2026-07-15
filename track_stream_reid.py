@@ -670,6 +670,15 @@ class BoTSORTTracker:
         class_ids = [class_ids_raw[i] for i in final_valid_indices]
         num_dets = len(final_valid_indices)
         
+        # Pre-compute current frame occluded detection indices
+        occluded_det_indices = set()
+        for i in range(num_dets):
+            for j in range(num_dets):
+                if i != j:
+                    if compute_iou(boxes[i], boxes[j]) > 0.40:
+                        occluded_det_indices.add(i)
+                        occluded_det_indices.add(j)
+        
         if not is_numpy:
             detections = detections[final_valid_indices]
             
@@ -815,14 +824,7 @@ class BoTSORTTracker:
                     
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             
-            # Pre-compute current frame occluded detection indices
-            occluded_det_indices = set()
-            for i in range(num_dets):
-                for j in range(num_dets):
-                    if i != j:
-                        if compute_iou(boxes[i], boxes[j]) > 0.40:
-                            occluded_det_indices.add(i)
-                            occluded_det_indices.add(j)
+            # Process matches
 
             for r, c in zip(row_ind, col_ind):
                 if cost_matrix[r, c] < 1e4:
