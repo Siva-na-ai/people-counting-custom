@@ -927,6 +927,18 @@ class BoTSORTTracker:
                 
         # Prune inactive tracks from the active list if they are inactive for > 150 frames (5 seconds)
         # to prevent memory build-up and CPU overhead, while keeping them in the global gallery for max_age.
+        pruned_tracks = [
+            t for t in self.tracks 
+            if (t.state == 'Confirmed' and t.time_since_update > 150)
+            or (t.state == 'Tentative' and t.time_since_update > 0)
+        ]
+        for t in pruned_tracks:
+            if t.person_id is not None:
+                try:
+                    self.registry.handle_track_lost(t.person_id)
+                except Exception:
+                    pass
+                    
         self.tracks = [
             t for t in self.tracks 
             if (t.state == 'Confirmed' and t.time_since_update <= 150) 

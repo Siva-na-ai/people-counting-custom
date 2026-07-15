@@ -120,7 +120,26 @@ class IdentityMatcher:
         if last_box is None:
             return True
             
-        # Validate same-camera walking speed limit
-        return self.movement_validator.validate_track_motion(
-            last_box, det_box, time_since_update, img_w, img_h
-        )
+        # Get last seen timestamp
+        last_seen_str = p.get("last_seen", None)
+        dt_seconds = 0.0
+        if last_seen_str is not None:
+            try:
+                from datetime import datetime
+                last_seen_dt = datetime.fromisoformat(last_seen_str)
+                dt_seconds = (datetime.now() - last_seen_dt).total_seconds()
+            except Exception:
+                pass
+                
+        is_lost = p.get("identity_state", None) == "LOST"
+        
+        if is_lost or dt_seconds > 2.0:
+            # Use long-term camera transition validation
+            return self.movement_validator.validate_camera_transition(
+                last_box, det_box, dt_seconds, img_w, img_h
+            )
+        else:
+            # Validate same-camera short-term walking speed limit
+            return self.movement_validator.validate_track_motion(
+                last_box, det_box, time_since_update, img_w, img_h
+            )

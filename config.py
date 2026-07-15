@@ -2,6 +2,7 @@ import os
 
 # Central configuration parameters for Face + Body Fusion ReID system
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+USE_BODY_REID = False  # Enable/disable Body ReID matching (Face-only ReID when False)
 
 # Model Paths
 REPVGG_HEF_PATH = os.path.expanduser(os.getenv("REPVGG_HEF_PATH", "/home/assimilate/models/repvgg_a0_person_reid_512.hef"))
