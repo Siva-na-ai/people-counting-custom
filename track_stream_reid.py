@@ -624,7 +624,7 @@ class BoTSORTTracker:
         scores_raw = []
         class_ids_raw = []
         
-        is_numpy = isinstance(detections, np.ndarray)
+        is_numpy = isinstance(detections, np.ndarray) or isinstance(detections, list)
         
         if isinstance(detections, list) and len(detections) > 0 and isinstance(detections[0], dict):
             for det in detections:
@@ -1039,15 +1039,18 @@ class BoTSORTTracker:
             # Return custom detections object filtered to confirmed only
             return detections[confirmed_mask]
         else:
-            if len(confirmed_indices) == 0:
-                return np.zeros(0, dtype=new_dtype)
-            tracked_arr = np.zeros(len(confirmed_indices), dtype=new_dtype)
-            for idx, d_idx in enumerate(confirmed_indices):
-                tracked_arr['box'][idx] = boxes[d_idx]
-                tracked_arr['confidence'][idx] = final_mapped_confs[d_idx]
-                tracked_arr['class_id'][idx] = class_ids[d_idx]
-                tracked_arr['track_id'][idx] = final_mapped_ids[d_idx]
-            return tracked_arr
+            result = []
+            for d_idx in confirmed_indices:
+                box_val = boxes[d_idx]
+                if isinstance(box_val, np.ndarray):
+                    box_val = box_val.flatten().tolist()
+                result.append((
+                    box_val,
+                    float(scores[d_idx]),
+                    int(class_ids[d_idx]),
+                    int(final_mapped_ids[d_idx])
+                ))
+            return result
 
 
 def get_args():
@@ -1168,7 +1171,14 @@ def main():
                     else:
                         labels.append(f"#Track {abs(t)} person: {s:0.2f}")
                     
-                annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
+                # Draw bounding boxes and labels using OpenCV
+                for idx, (box, s, c, t) in enumerate(detections):
+                    x1, y1, x2, y2 = map(int, box)
+                    color = (0, 255, 255) if t > 0 else (255, 0, 255) # Cyan for person, Magenta for track
+                    cv2.rectangle(frame.image, (x1, y1), (x2, y2), color, 2)
+                    if idx < len(labels):
+                        cv2.putText(frame.image, labels[idx], (x1, max(y1 - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
                 #-----Stream to HTTP-----
                 if args.stream:
