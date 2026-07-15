@@ -121,30 +121,50 @@ class HailoYOLOv8Detector:
         raw_outputs = self.infer_pipeline.infer(input_data)
         nms_results = raw_outputs[self.output_name][0]
         
-        # Unpack integrated NMS by class (class 0 = Person)
-        # Structure is 501 floats per class
-        flat_results = nms_results.flatten()
-        class_offset = 0 * 501
-        num_detections = int(flat_results[class_offset])
-        
         detections = []
-        for b in range(num_detections):
-            offset = class_offset + 1 + b * 5
-            ymin, xmin, ymax, xmax, score = flat_results[offset : offset + 5]
+        
+        # Format 1: nms_results is a list/tuple of arrays (one per class, e.g., class 0 at index 0)
+        if isinstance(nms_results, (list, tuple)):
+            if len(nms_results) > 0:
+                class_0_detections = nms_results[0]
+                if isinstance(class_0_detections, np.ndarray) and class_0_detections.ndim == 2:
+                    for detection in class_0_detections:
+                        # Depending on configuration, it may have shape (N, 5) with [ymin, xmin, ymax, xmax, score] or similar
+                        if len(detection) >= 5:
+                            ymin, xmin, ymax, xmax, score = detection[:5]
+                            if score >= threshold:
+                                x1 = max(0.0, float(xmin * w_img))
+                                y1 = max(0.0, float(ymin * h_img))
+                                x2 = min(float(w_img), float(xmax * w_img))
+                                y2 = min(float(h_img), float(ymax * h_img))
+                                detections.append({
+                                    "bbox": [x1, y1, x2, y2],
+                                    "score": float(score),
+                                    "class_id": 0
+                                })
+                                
+        # Format 2: nms_results is a numpy array (raw Hailo NMS-by-class flattened buffer)
+        elif isinstance(nms_results, np.ndarray):
+            flat_results = nms_results.flatten()
+            class_offset = 0 * 501
+            num_detections = int(flat_results[class_offset])
             
-            if score >= threshold:
-                # Convert normalized coordinates (0 to 1) to absolute pixels
-                x1 = max(0.0, float(xmin * w_img))
-                y1 = max(0.0, float(ymin * h_img))
-                x2 = min(float(w_img), float(xmax * w_img))
-                y2 = min(float(h_img), float(ymax * h_img))
+            for b in range(num_detections):
+                offset = class_offset + 1 + b * 5
+                ymin, xmin, ymax, xmax, score = flat_results[offset : offset + 5]
                 
-                detections.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "score": float(score),
-                    "class_id": 0
-                })
-                
+                if score >= threshold:
+                    x1 = max(0.0, float(xmin * w_img))
+                    y1 = max(0.0, float(ymin * h_img))
+                    x2 = min(float(w_img), float(xmax * w_img))
+                    y2 = min(float(h_img), float(ymax * h_img))
+                    
+                    detections.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "score": float(score),
+                        "class_id": 0
+                    })
+                    
         return detections
 
     def close(self):
