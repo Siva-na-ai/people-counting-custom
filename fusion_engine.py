@@ -34,10 +34,13 @@ class FusionEngine:
             face_emb, body_emb, det_box, time_since_update, img_w, img_h
         )
         
-        # 2. If no candidate matched, allocate a new Person ID
+        # 2. If no candidate matched, allocate a new Person ID only if a face is detected
         if candidate_pid is None:
-            candidate_pid = next_person_id_callback()
-            confidence = 1.0
+            if face_emb is not None:
+                candidate_pid = next_person_id_callback()
+                confidence = 1.0
+            else:
+                return None, 0.0
             
         # 3. Apply TemporalValidator to filter flickering identity transitions
         final_person_id = self.temporal_validator.validate_identity(track_id, candidate_pid)
