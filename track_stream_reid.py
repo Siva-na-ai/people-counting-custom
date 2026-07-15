@@ -25,7 +25,8 @@ from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from modlib.apps import Annotator
 from modlib.devices import AiCamera
-from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
+from modlib.models.zoo import NanoDetPlus416x416
+from yolo_detector import HailoYOLOv8Detector
 from scipy.optimize import linear_sum_assignment
 
 try:
@@ -329,6 +330,7 @@ class Track:
         self.hits = 1 if score >= 0.70 else 0
         self.velocity = np.zeros(2)
         self.person_id = None
+        self.identity_state = 'NEW_TRACK'
 
     def add_embedding(self, embedding: np.ndarray, quality_score: float):
         if embedding is None:
@@ -412,9 +414,10 @@ class BoTSORTTracker:
         self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry)
         self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
         
-        # Load Hailo Face engines
+        # Load Hailo Face and YOLOv8 engines
         self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH, target=self.shared_target)
         self.face_rec = HailoFaceRecognizer(hef_path=config.ARCFACE_HEF_PATH, target=self.shared_target)
+        self.yolo_detector = HailoYOLOv8Detector(target=self.shared_target)
         
         # Pipeline Coordinator
         self.identity_mgr = IdentityManager(
@@ -423,6 +426,11 @@ class BoTSORTTracker:
         )
         
     def close(self):
+        if hasattr(self, 'yolo_detector') and self.yolo_detector:
+            try:
+                self.yolo_detector.close()
+            except Exception:
+                pass
         if hasattr(self, 'reid') and self.reid:
             self.reid.close()
         if hasattr(self, 'face_det') and self.face_det:
@@ -618,7 +626,12 @@ class BoTSORTTracker:
         
         is_numpy = isinstance(detections, np.ndarray)
         
-        if not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
+        if isinstance(detections, list) and len(detections) > 0 and isinstance(detections[0], dict):
+            for det in detections:
+                boxes_raw.append(det["bbox"])
+                scores_raw.append(det["score"])
+                class_ids_raw.append(det["class_id"])
+        elif not is_numpy and hasattr(detections, 'coords') and hasattr(detections, 'confidence'):
             boxes_raw = detections.coords
             scores_raw = detections.confidence
             class_ids_raw = detections.class_id
@@ -867,8 +880,40 @@ class BoTSORTTracker:
                         return self.next_person_id
 
                     pid, state, conf = self.identity_mgr.process_observation(
-                        frame_image, track.track_id, track.box, track.score, track.time_since_update, self.camera_id, get_pid, is_occluded
+                        frame_image, track.track_id, track.box, track.score, track.time_since_update, 
+                        self.camera_id, get_pid, is_occluded, current_person_id=track.person_id
                     )
+                    
+                    # Update Track identity state machine
+                    if track.identity_state == 'NEW_TRACK':
+                        track.identity_state = 'TRACKING'
+                        
+                    if pid is not None:
+                        if track.identity_state in ['LOST', 'TRACKING', 'NEW_TRACK']:
+                            if track.person_id is not None:
+                                track.identity_state = 'REIDENTIFIED'
+                            else:
+                                track.identity_state = 'CONFIRMED_PERSON'
+                        else:
+                            track.identity_state = 'CONFIRMED_PERSON'
+                    else:
+                        # Check if face is visible or passed quality gates to show progress
+                        person_crop = self.get_crop(frame_image, track.box)
+                        if person_crop is not None and person_crop.size > 0:
+                            face_dets = self.face_det.detect(person_crop, threshold=0.55)
+                            if len(face_dets) > 0:
+                                track.identity_state = 'FACE_VISIBLE'
+                                best_face = max(face_dets, key=lambda f: f["score"])
+                                fx1 = max(0, int(best_face["bbox"][0]))
+                                fy1 = max(0, int(best_face["bbox"][1]))
+                                fx2 = min(person_crop.shape[1], int(best_face["bbox"][2]))
+                                fy2 = min(person_crop.shape[0], int(best_face["bbox"][3]))
+                                face_crop = person_crop[fy1:fy2, fx1:fx2]
+                                if face_crop.size > 0:
+                                    from embedding_quality import evaluate_face_quality
+                                    face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                                    if face_ok:
+                                        track.identity_state = 'FACE_QUALITY_PASSED'
                     
                     if pid == self.next_person_id:
                         self.next_person_id += 1
@@ -889,6 +934,7 @@ class BoTSORTTracker:
             det_class = int(class_ids[d_idx].item()) if isinstance(class_ids[d_idx], np.ndarray) else int(class_ids[d_idx])
             
             new_track = Track(self.next_track_id, det_box, None, det_score, det_class, state='Tentative')
+            new_track.identity_state = 'NEW_TRACK'
             self.next_track_id += 1
             
             cx = (det_box[0] + det_box[2]) / 2.0
@@ -898,9 +944,30 @@ class BoTSORTTracker:
             is_occluded = (d_idx in occluded_det_indices)
             
             pid, state, conf = self.identity_mgr.process_observation(
-                frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, self.camera_id, lambda: self.next_person_id, is_occluded
+                frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, 
+                self.camera_id, lambda: self.next_person_id, is_occluded, current_person_id=new_track.person_id
             )
             
+            if pid is not None:
+                new_track.identity_state = 'CONFIRMED_PERSON'
+            else:
+                person_crop = self.get_crop(frame_image, new_track.box)
+                if person_crop is not None and person_crop.size > 0:
+                    face_dets = self.face_det.detect(person_crop, threshold=0.55)
+                    if len(face_dets) > 0:
+                        new_track.identity_state = 'FACE_VISIBLE'
+                        best_face = max(face_dets, key=lambda f: f["score"])
+                        fx1 = max(0, int(best_face["bbox"][0]))
+                        fy1 = max(0, int(best_face["bbox"][1]))
+                        fx2 = min(person_crop.shape[1], int(best_face["bbox"][2]))
+                        fy2 = min(person_crop.shape[0], int(best_face["bbox"][3]))
+                        face_crop = person_crop[fy1:fy2, fx1:fx2]
+                        if face_crop.size > 0:
+                            from embedding_quality import evaluate_face_quality
+                            face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                            if face_ok:
+                                new_track.identity_state = 'FACE_QUALITY_PASSED'
+                                
             if pid == self.next_person_id:
                 self.next_person_id += 1
                 
@@ -924,6 +991,7 @@ class BoTSORTTracker:
         for track in self.tracks:
             if track not in matched_tracks:
                 track.time_since_update += 1
+                track.identity_state = 'LOST'
                 
         # Prune inactive tracks from the active list if they are inactive for > 150 frames (5 seconds)
         # to prevent memory build-up and CPU overhead, while keeping them in the global gallery for max_age.
@@ -1052,7 +1120,7 @@ def main():
     device.deploy = patched_deploy
     
     device.camera_id = ""
-    model = SSDMobileNetV2FPNLite320x320()
+    model = NanoDetPlus416x416()
     device.deploy(model)
 
     # Initialize BoTSORT Tracker (combining tracking and ReID) with user-configurable parameters to prevent early embedding removal
@@ -1072,12 +1140,11 @@ def main():
     try:
         with device as stream:
             for frame in stream:
-                #-----Detection Filtering-----
-                detections = frame.detections[frame.detections.confidence > 0.55]
-                detections = detections[detections.class_id == 0]  # Person
+                #-----YOLOv8 Detection (Host-Side Hailo-8L)-----
+                yolo_dets = tracker.yolo_detector.detect(frame.image, threshold=0.55)
                 
                 #-----Tracker Update-----
-                detections = tracker.update(frame.image, detections)
+                detections = tracker.update(frame.image, yolo_dets)
 
                 #-----ReID / Unique Visitor Count-----
                 for idx, (_, s, c, t) in enumerate(detections):
@@ -1097,9 +1164,9 @@ def main():
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
                     if t > 0:
-                        labels.append(f"#Person {t} {model.labels[c]}: {s:0.2f}")
+                        labels.append(f"#Person {t} person: {s:0.2f}")
                     else:
-                        labels.append(f"#Track {abs(t)} {model.labels[c]}: {s:0.2f}")
+                        labels.append(f"#Track {abs(t)} person: {s:0.2f}")
                     
                 annotator.annotate_boxes(frame=frame, detections=detections, labels=labels)
 
