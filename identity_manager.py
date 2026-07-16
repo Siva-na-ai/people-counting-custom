@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+import cv2
 import numpy as np
 from typing import Dict, Any, Tuple, Optional
 import config
@@ -189,6 +190,10 @@ class IdentityManager:
         # 7. Logging ReID decisions
         decision = match_details.get("decision", "Rejected")
         reason = match_details.get("reason", quality_reason)
+        landmarks_log_str = "None"
+        if len(face_dets) > 0:
+            landmarks_log_str = str([[int(pt[0]), int(pt[1])] for pt in best_face["landmarks"]])
+            
         logger.info(
             f"[ReID Decision] Track={track_id} | State={p_state} | "
             f"Current PID={t_state.confirmed_id} | Candidate PID={match_details.get('top1_pid')} | "
@@ -196,7 +201,7 @@ class IdentityManager:
             f"Fusion={match_details.get('fusion_score'):.3f} | Top1={match_details.get('top1_score'):.3f} | "
             f"Top2={match_details.get('top2_score'):.3f} | Gap={match_details.get('gap'):.3f} | "
             f"Size={face_size} | Blur={blur_score:.1f} | Yaw={yaw:.1f} | Pitch={pitch:.1f} | Roll={roll:.1f} | "
-            f"Decision={decision} | Reason={reason} | Latency={latency:.1f}ms"
+            f"Landmarks={landmarks_log_str} | Decision={decision} | Reason={reason} | Latency={latency:.1f}ms"
         )
 
         if person_id is None:
