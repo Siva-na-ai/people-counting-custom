@@ -16,8 +16,8 @@ CONFIRMATION_THRESHOLD = 3  # Hits required to confirm a track (was 5 - faster c
 
 # Production-Grade ReID Configuration Parameters
 
-# Face thresholds
-FACE_MATCH_THRESHOLD = 0.82
+# Face recognition thresholds
+FACE_MATCH_THRESHOLD = 0.85
 FACE_STRONG_MATCH = 0.90
 FACE_TEMPLATE_UPDATE = 0.93
 

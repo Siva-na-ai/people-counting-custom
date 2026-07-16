@@ -236,7 +236,7 @@ class IdentityManager:
             # Only save a new face template if:
             # - Face quality passed.
             # - It's a new person OR similarity to existing template is high (>= FACE_TEMPLATE_UPDATE)
-            is_new_person = (match_details.get("top1_score", 0.0) == 0.0)
+            is_new_person = "Created new Person ID" in match_details.get("reason", "")
             is_good_template = match_details.get("top1_score", 0.0) >= config.FACE_TEMPLATE_UPDATE
             
             if face_emb is not None and face_ok and (is_new_person or is_good_template):
