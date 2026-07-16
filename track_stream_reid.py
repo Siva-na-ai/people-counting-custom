@@ -16,6 +16,7 @@
 
 import logging
 import os
+import time
 from typing import Optional
 import cv2
 import numpy as np
@@ -950,7 +951,6 @@ class BoTSORTTracker:
             is_occluded = (d_idx in occluded_det_indices)
             
             # Clean expired recovery cache entries (older than 120s)
-            import time
             now_time = time.time()
             self.recovery_cache = {
                 k_pid: k_entry for k_pid, k_entry in self.recovery_cache.items()
