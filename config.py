@@ -2,7 +2,7 @@ import os
 
 # Central configuration parameters for Face + Body Fusion ReID system
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-USE_BODY_REID = False  # Enable/disable Body ReID matching (Face-only ReID when False)
+USE_BODY_REID = True  # Enable/disable Body ReID matching (Face-only ReID when False)
 
 # Model Paths
 YOLOv8_HEF_PATH = os.path.expanduser(os.getenv("YOLOv8_HEF_PATH", "/usr/share/hailo-models/yolov8s_h8l.hef"))
