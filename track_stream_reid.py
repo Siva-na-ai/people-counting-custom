@@ -1106,12 +1106,24 @@ def get_args():
         default=0.2,
         help="Hungarian matching weight for motion consistency cost (default: 0.2)"
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity level (default: INFO). Use DEBUG to see face pipeline details."
+    )
     return parser.parse_args()
 
 
 def main():
     args = get_args()
-    
+
+    # Apply log level from --log-level argument
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s:%(name)s:%(message)s"
+    )
     #-----Camera and AI setup-----
     device = AiCamera(frame_rate=15)
     
