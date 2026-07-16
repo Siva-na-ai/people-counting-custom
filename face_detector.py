@@ -122,11 +122,22 @@ class HailoFaceDetector:
         self._activate_network()
         crop_h, crop_w = person_crop_bgr.shape[:2]
         
-        # Prepare input
+        # Prepare input preserving aspect ratio via padding
         crop_rgb = cv2.cvtColor(person_crop_bgr, cv2.COLOR_BGR2RGB)
-        crop_resized = cv2.resize(crop_rgb, (self.width, self.height))
+        scale = min(self.width / crop_w, self.height / crop_h)
+        new_w = int(crop_w * scale)
+        new_h = int(crop_h * scale)
+        
+        crop_resized = cv2.resize(crop_rgb, (new_w, new_h))
+        
+        pad_x = (self.width - new_w) // 2
+        pad_y = (self.height - new_h) // 2
+        
+        padded = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = crop_resized
+        
         input_data = {
-            self.input_name: np.expand_dims(crop_resized, axis=0).astype(np.float32)
+            self.input_name: np.expand_dims(padded, axis=0).astype(np.float32)
         }
         
         # Inference
@@ -167,11 +178,11 @@ class HailoFaceDetector:
                 x2 = anchor[0] + offset_box[2] * stride
                 y2 = anchor[1] + offset_box[3] * stride
                 
-                # Rescale boxes back to original crop size
-                x1_scaled = (x1 / self.width) * crop_w
-                y1_scaled = (y1 / self.height) * crop_h
-                x2_scaled = (x2 / self.width) * crop_w
-                y2_scaled = (y2 / self.height) * crop_h
+                # Rescale boxes back to original crop size (accounting for padding and scale)
+                x1_scaled = (x1 - pad_x) / scale
+                y1_scaled = (y1 - pad_y) / scale
+                x2_scaled = (x2 - pad_x) / scale
+                y2_scaled = (y2 - pad_y) / scale
                 
                 # Decoded landmarks (5 landmarks x 2 coordinates)
                 offset_kps = kps[k_idx].reshape(5, 2)
@@ -179,8 +190,8 @@ class HailoFaceDetector:
                 for pt_idx in range(5):
                     pt_x = anchor[0] + offset_kps[pt_idx, 0] * stride
                     pt_y = anchor[1] + offset_kps[pt_idx, 1] * stride
-                    landmarks_scaled[pt_idx, 0] = (pt_x / self.width) * crop_w
-                    landmarks_scaled[pt_idx, 1] = (pt_y / self.height) * crop_h
+                    landmarks_scaled[pt_idx, 0] = (pt_x - pad_x) / scale
+                    landmarks_scaled[pt_idx, 1] = (pt_y - pad_y) / scale
                     
                 all_boxes.append([x1_scaled, y1_scaled, x2_scaled, y2_scaled])
                 all_scores.append(score)
