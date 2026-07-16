@@ -12,16 +12,16 @@ ARCFACE_HEF_PATH = os.path.expanduser(os.getenv("ARCFACE_HEF_PATH", "/home/assim
 
 # Tracker settings
 MAX_AGE = 900
-CONFIRMATION_THRESHOLD = 5  # Hits required to confirm a track
+CONFIRMATION_THRESHOLD = 3  # Hits required to confirm a track (was 5 - faster confirmation)
 
-# Embedding Quality Thresholds (Production Settings)
-FACE_MIN_SIZE = 45          # Minimum face bounding box width/height
-FACE_BLUR_THRESHOLD = 50.0  # Minimum Laplacian variance for sharpness
-FACE_BRIGHTNESS_MIN = 40    # Minimum average pixel brightness
-FACE_BRIGHTNESS_MAX = 220   # Maximum average pixel brightness
-FACE_ANGLE_YAW_MAX = 35.0   # Maximum yaw angle
-FACE_ANGLE_PITCH_MAX = 30.0 # Maximum pitch angle
-FACE_ANGLE_ROLL_MAX = 20.0  # Maximum roll angle
+# Embedding Quality Thresholds (Entrance Camera Settings)
+FACE_MIN_SIZE = 32          # Minimum face bounding box width/height (was 45 - too strict for far/moving people)
+FACE_BLUR_THRESHOLD = 15.0  # Minimum Laplacian variance (was 50 - walking motion always causes blur)
+FACE_BRIGHTNESS_MIN = 30    # Minimum average pixel brightness (was 40)
+FACE_BRIGHTNESS_MAX = 230   # Maximum average pixel brightness (was 220)
+FACE_ANGLE_YAW_MAX = 50.0   # Maximum yaw angle (was 35 - entrance angle is rarely frontal)
+FACE_ANGLE_PITCH_MAX = 45.0 # Maximum pitch angle (was 30)
+FACE_ANGLE_ROLL_MAX = 35.0  # Maximum roll angle (was 20)
 
 BODY_BLUR_THRESHOLD = 0.0   # Disable blur check for body ReID (highly robust to blur)
 BODY_MIN_SIZE = 64          # Minimum body size

@@ -104,8 +104,8 @@ def evaluate_face_quality(
     if h < config.FACE_MIN_SIZE or w < config.FACE_MIN_SIZE:
         return False, 0.0, details
         
-    # 2. Strict score/occlusion gate: SCRFD confidence must be high
-    if score < 0.70:
+    # 2. Score/occlusion gate: must match detection threshold (0.55)
+    if score < 0.55:
         return False, 0.0, details
         
     # Convert to grayscale for blur and brightness
