@@ -1244,10 +1244,13 @@ def main():
                         # Temporary track
                         track_id = abs(int(t))
                         state_name = "TEMPORARY_TRACK"
+                        reason = "No face detected"
                         state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(track_id)
                         if state_obj:
                             state_name = state_obj.state
-                        labels.append(f"T{track_id} ({state_name})")
+                            if hasattr(state_obj, "reason"):
+                                reason = state_obj.reason
+                        labels.append(f"T{track_id} ({state_name}) - {reason}")
                         colors.append((0, 0, 255)) # Red
                     
                 # Draw bounding boxes and labels using OpenCV

@@ -18,6 +18,7 @@ class TrackIdentityState:
         self.identity_confidence = 0.0  # 0.0 to 1.0
         self.good_face_confirmations = 0 # Counter for consecutive good face frames
         self.face_box: Optional[list] = None # Face coordinates relative to full frame
+        self.reason = "No face detected" # Reason why track is red/unverified
         
         # Rolling histories
         self.match_history: List[Optional[int]] = []

@@ -183,6 +183,12 @@ class IdentityManager:
             face_quality_passed=face_ok
         )
 
+        # Store rejection/status reason in state for visual display
+        if not face_ok:
+            t_state.reason = quality_reason
+        else:
+            t_state.reason = match_details.get("reason", "Waiting for good face")
+
         p_state = t_state.state
 
         # 6. Apply Search Cooldown on actual search failure / rejection
