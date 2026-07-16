@@ -122,9 +122,11 @@ class IdentityManager:
             p_state = "CONFIRMED"
         else:
             # Run FusionEngine to resolve final Person ID (searches Qdrant)
-            # Only searches face (if face_emb is not None) or body (if USE_BODY_REID/restore)
+            # face_detected=True even if face_emb is None (quality check may have failed)
             person_id, confidence = self.fusion.resolve_identity(
-                track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h, next_person_id_callback
+                track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h,
+                next_person_id_callback,
+                face_detected=(len(face_dets) > 0)
             )
             
         if person_id is None:

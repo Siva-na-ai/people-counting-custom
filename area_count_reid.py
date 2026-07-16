@@ -1505,7 +1505,7 @@ def start_area_count_demo():
     print(f"    DB_SSLMODE: {os.getenv('DB_SSLMODE')}")
 
     model = NanoDetPlus416x416()
-    device = AiCamera()
+    device = AiCamera(frame_rate=15)
     
     # Monkey-patch device.deploy to prevent a bug in modlib where start() redeploys with camera_id=None
     original_deploy = device.deploy

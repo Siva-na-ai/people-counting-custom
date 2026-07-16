@@ -1113,7 +1113,7 @@ def main():
     args = get_args()
     
     #-----Camera and AI setup-----
-    device = AiCamera()
+    device = AiCamera(frame_rate=15)
     
     # Monkey-patch device.deploy to prevent a bug in modlib where start() redeploys with camera_id=None
     original_deploy = device.deploy

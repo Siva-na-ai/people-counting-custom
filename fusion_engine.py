@@ -23,22 +23,35 @@ class FusionEngine:
         time_since_update: int,
         img_w: int,
         img_h: int,
-        next_person_id_callback: callable
+        next_person_id_callback: callable,
+        face_detected: bool = False
     ) -> Tuple[int, float]:
         """
         Runs multi-modal fusion checks.
         Returns: (final_person_id, confidence_score)
+
+        face_detected: True if a face was visible in the crop, even if quality
+                       check prevented embedding extraction. Used to assign a
+                       new Person ID even when face_emb is None.
         """
         # 1. Search vector DB and fuse similarity metrics
         candidate_pid, confidence = self.matcher.match_identity(
             face_emb, body_emb, det_box, time_since_update, img_w, img_h
         )
         
-        # 2. If no candidate matched, allocate a new Person ID only if a face is detected
+        # 2. If no candidate matched, allocate a new Person ID if:
+        #    - a good face embedding was extracted (face_emb), OR
+        #    - a face was at least detected (face_detected) even if quality blocked embedding
         if candidate_pid is None:
             if face_emb is not None:
+                # Full quality face — assign with full confidence
                 candidate_pid = next_person_id_callback()
                 confidence = 1.0
+            elif face_detected:
+                # Face visible but quality check blocked embedding extraction.
+                # Still assign a new ID so the person is tracked (low confidence).
+                candidate_pid = next_person_id_callback()
+                confidence = 0.5
             else:
                 return None, 0.0
             
