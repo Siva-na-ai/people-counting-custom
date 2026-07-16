@@ -1222,7 +1222,10 @@ class BoTSORTTracker:
                     def get_pid():
                         if track.person_id is not None:
                             return track.person_id
-                        return self.next_person_id
+                        # Allocate and increment atomically
+                        new_pid = self.next_person_id
+                        self.next_person_id += 1
+                        return new_pid
 
                     pid, state, conf = self.identity_mgr.process_observation(
                         frame_image, track.track_id, track.box, track.score, track.time_since_update, 
@@ -1260,9 +1263,6 @@ class BoTSORTTracker:
                                     if face_ok:
                                         track.identity_state = 'FACE_QUALITY_PASSED'
                     
-                    if pid == self.next_person_id:
-                        self.next_person_id += 1
-                        
                     track.person_id = pid
                     
                     final_mapped_ids[c] = track.person_id if track.person_id is not None else -int(track.track_id)
@@ -1288,9 +1288,14 @@ class BoTSORTTracker:
             
             is_occluded = (d_idx in occluded_det_indices)
             
+            def get_new_pid():
+                new_pid = self.next_person_id
+                self.next_person_id += 1
+                return new_pid
+
             pid, state, conf = self.identity_mgr.process_observation(
                 frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, 
-                self.camera_id, lambda: self.next_person_id, is_occluded, current_person_id=new_track.person_id
+                self.camera_id, get_new_pid, is_occluded, current_person_id=new_track.person_id
             )
             
             if pid is not None:
@@ -1312,9 +1317,6 @@ class BoTSORTTracker:
                             face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
                             if face_ok:
                                 new_track.identity_state = 'FACE_QUALITY_PASSED'
-                                
-            if pid == self.next_person_id:
-                self.next_person_id += 1
                 
             new_track.person_id = pid
             if state in ['CONFIRMED', 'REIDENTIFIED']:
@@ -1861,18 +1863,26 @@ def start_area_count_demo():
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
                     if t > 0:
-                        labels.append(f"#Person {t} person: {s:0.2f}")
+                        # Confirmed person — check if face was detected
+                        track_obj = None
+                        for tk in tracker.tracks:
+                            if tk.person_id == t:
+                                track_obj = tk
+                                break
+                        has_face = track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED', 'CONFIRMED_PERSON', 'REIDENTIFIED')
+                        face_label = "face" if has_face else "no face"
+                        labels.append(f"#Person {t} {face_label}: {s:0.2f}")
                     else:
-                        # Check track identity_state for face quality feedback
+                        # Unconfirmed track — check identity_state for face feedback
                         track_obj = None
                         for tk in tracker.tracks:
                             if tk.track_id == abs(t):
                                 track_obj = tk
                                 break
-                        if track_obj is not None and track_obj.identity_state == 'FACE_VISIBLE':
-                            labels.append(f"#Track {abs(t)} (face not proper) person: {s:0.2f}")
+                        if track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED'):
+                            labels.append(f"#Track {abs(t)} face: {s:0.2f}")
                         else:
-                            labels.append(f"#Track {abs(t)} person: {s:0.2f}")
+                            labels.append(f"#Track {abs(t)} no face: {s:0.2f}")
 
                 # Draw bounding boxes and labels using OpenCV
                 for idx, (box, s, c, t) in enumerate(detections):
@@ -1881,7 +1891,7 @@ def start_area_count_demo():
                     cv2.rectangle(frame.image, (x1, y1), (x2, y2), color, 2)
                     if idx < len(labels):
                         cv2.putText(frame.image, labels[idx], (x1, max(y1 - 10, 20)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
                 
                 if using_zones:
                     h_img, w_img = frame.image.shape[:2]
