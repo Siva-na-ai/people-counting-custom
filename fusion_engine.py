@@ -1,12 +1,12 @@
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import config
 
 class FusionEngine:
     """
     Orchestrates the decision engine, combining Top-K similarity searches,
-    temporal stability validation, visual quality scores, and movement constraints
-    to output a final consolidated Person ID.
+    temporal stability validation, visual quality scores, and body verification
+    to resolve a stable consolidated Person ID.
     """
     def __init__(self, matcher, temporal_validator, registry):
         self.matcher = matcher
@@ -24,37 +24,55 @@ class FusionEngine:
         img_w: int,
         img_h: int,
         next_person_id_callback: callable,
-        face_detected: bool = False
-    ) -> Tuple[int, float]:
+        face_quality_passed: bool = False
+    ) -> Tuple[Optional[int], float, Dict[str, Any]]:
         """
         Runs multi-modal fusion checks.
-        Returns: (final_person_id, confidence_score)
-
-        face_detected: True if a face was visible in the crop, even if quality
-                       check prevented embedding extraction. Used to assign a
-                       new Person ID even when face_emb is None.
+        Returns: (final_person_id, confidence_score, match_details)
         """
         # 1. Search vector DB and fuse similarity metrics
-        candidate_pid, confidence = self.matcher.match_identity(
+        candidate_pid, confidence, match_details = self.matcher.match_identity(
             face_emb, body_emb, det_box, time_since_update, img_w, img_h
         )
-        
-        # 2. If no candidate matched, allocate a new Person ID ONLY if a quality
-        #    face embedding was extracted. A detected face without a good embedding
-        #    (face_detected=True but face_emb=None) must NOT get a new ID because
-        #    nothing would be stored in Qdrant → the person can never be re-matched
-        #    on re-entry → duplicate IDs every visit.
+
+        state = self.temporal_validator.get_state(track_id)
+        if state is None:
+            from temporal_validator import TrackIdentityState
+            state = TrackIdentityState(track_id)
+            self.temporal_validator.track_states[track_id] = state
+
+        # Initialize unmatched count if not present
+        if not hasattr(state, "unmatched_face_observations"):
+            state.unmatched_face_observations = 0
+
+        # 2. Handle unmatched observations (New Person Creation Delay)
         if candidate_pid is None:
-            if face_emb is not None:
-                # Full quality face embedding — assign with full confidence
-                candidate_pid = next_person_id_callback()
-                confidence = 1.0
+            if face_emb is not None and face_quality_passed:
+                state.unmatched_face_observations += 1
+                match_details["reason"] = f"Unmatched high-quality face ({state.unmatched_face_observations}/{config.MIN_NEW_PERSON_OBSERVATIONS} frames)"
+                
+                # Check if we have collected enough stable, unmatched observations
+                if state.unmatched_face_observations >= config.MIN_NEW_PERSON_OBSERVATIONS:
+                    # Allocate a brand new PID
+                    candidate_pid = next_person_id_callback()
+                    confidence = 1.0
+                    state.unmatched_face_observations = 0
+                    match_details["decision"] = "Accepted"
+                    match_details["reason"] = "Created new persistent Person ID"
+                else:
+                    # Keep tentative
+                    confidence = 0.0
             else:
-                # Face may be visible but quality check blocked embedding extraction.
-                # Do NOT assign a new ID — wait until a good embedding frame arrives.
-                return None, 0.0
-            
+                # Poor quality / no face -> reset unmatched count
+                state.unmatched_face_observations = 0
+                confidence = 0.0
+        else:
+            # We matched someone -> reset unmatched counter
+            state.unmatched_face_observations = 0
+
         # 3. Apply TemporalValidator to filter flickering identity transitions
-        final_person_id = self.temporal_validator.validate_identity(track_id, candidate_pid)
-        
-        return final_person_id, confidence
+        final_person_id, p_state, final_conf = self.temporal_validator.validate_identity(
+            track_id, candidate_pid, confidence, face_quality_passed
+        )
+
+        return final_person_id, final_conf, match_details

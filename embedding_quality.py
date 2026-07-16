@@ -83,23 +83,67 @@ def estimate_pose_pnp(landmarks: np.ndarray) -> Tuple[float, float, float]:
 def evaluate_face_quality(
     crop: np.ndarray, 
     score: float, 
-    landmarks: Optional[np.ndarray] = None
-) -> Tuple[bool, float, Dict[str, Any]]:
+    landmarks: Optional[np.ndarray] = None,
+    parent_w: int = 1920,
+    parent_h: int = 1080,
+    face_box_coords: Optional[np.ndarray] = None
+) -> Tuple[bool, float, float, float, float, float, str]:
     """
-    Minimal face quality check — quality gates removed.
-    Any face detected by SCRFD with score >= 0.55 and a non-empty crop is accepted.
-    ArcFace handles pose/blur variations internally.
-    Returns: (is_valid, final_quality_score, details_dict)
+    Evaluates face crop quality strictly against production config rules.
+    Returns: (passed, quality_score, blur_score, yaw, pitch, roll, failure_reason)
     """
-    details = {"score": score}
+    # Defaults
+    quality_score = 0.0
+    blur_score = 0.0
+    yaw, pitch, roll = 0.0, 0.0, 0.0
 
     if crop is None or crop.size == 0:
-        return False, 0.0, details
+        return False, 0.0, 0.0, 0.0, 0.0, 0.0, "Empty crop"
 
-    if score < 0.55:
-        return False, 0.0, details
+    h, w = crop.shape[:2]
+    
+    # 1. Bounding box coordinates check (Fully inside frame boundary)
+    if face_box_coords is not None:
+        fx1, fy1, fx2, fy2 = face_box_coords
+        if fx1 < 0 or fy1 < 0 or fx2 > parent_w or fy2 > parent_h:
+            return False, 0.0, 0.0, 0.0, 0.0, 0.0, f"Face not fully inside frame boundary: box={[int(x) for x in face_box_coords]}"
 
-    return True, float(score), details
+    # 2. Score threshold check
+    if score < config.FACE_MIN_CONFIDENCE:
+        return False, 0.0, 0.0, 0.0, 0.0, 0.0, f"Confidence low: {score:.3f} < {config.FACE_MIN_CONFIDENCE}"
+
+    # 3. Size check
+    if w < config.FACE_MIN_WIDTH or h < config.FACE_MIN_HEIGHT:
+        return False, 0.0, 0.0, 0.0, 0.0, 0.0, f"Face too small: {w}x{h} < {config.FACE_MIN_WIDTH}x{config.FACE_MIN_HEIGHT}"
+
+    # 4. Blur check
+    img_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    blur_score = get_laplacian_variance(img_gray)
+    if blur_score <= config.FACE_BLUR_THRESHOLD:
+        return False, 0.0, blur_score, 0.0, 0.0, 0.0, f"Blur score low (blurry): {blur_score:.2f} <= {config.FACE_BLUR_THRESHOLD}"
+
+    # 5. Landmarks validation
+    if landmarks is None or len(landmarks) != 5:
+        return False, 0.0, blur_score, 0.0, 0.0, 0.0, "Missing or invalid 5 landmarks"
+
+    # Ensure all landmarks coordinates fall inside the face crop boundaries
+    for pt_idx, pt in enumerate(landmarks):
+        px, py = pt
+        if px < 0 or px > w or py < 0 or py > h:
+            return False, 0.0, blur_score, 0.0, 0.0, 0.0, f"Landmark #{pt_idx} coordinate {pt} out of crop boundaries {w}x{h}"
+
+    # 6. Pose angles estimation
+    yaw, pitch, roll = estimate_pose_pnp(landmarks)
+    if yaw >= config.FACE_MAX_YAW:
+        return False, 0.0, blur_score, yaw, pitch, roll, f"Yaw too high: {yaw:.1f}° >= {config.FACE_MAX_YAW}°"
+    if pitch >= config.FACE_MAX_PITCH:
+        return False, 0.0, blur_score, yaw, pitch, roll, f"Pitch too high: {pitch:.1f}° >= {config.FACE_MAX_PITCH}°"
+    if roll >= config.FACE_MAX_ROLL:
+        return False, 0.0, blur_score, yaw, pitch, roll, f"Roll too high: {roll:.1f}° >= {config.FACE_MAX_ROLL}°"
+
+    # High quality passed
+    quality_score = float(score)
+    return True, quality_score, blur_score, yaw, pitch, roll, "Success"
 
 
 def evaluate_body_quality(crop: np.ndarray, score: float) -> Tuple[bool, float, Dict[str, Any]]:

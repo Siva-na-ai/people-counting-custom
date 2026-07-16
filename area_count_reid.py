@@ -1259,14 +1259,14 @@ class BoTSORTTracker:
                                 face_crop = person_crop[fy1:fy2, fx1:fx2]
                                 if face_crop.size > 0:
                                     from embedding_quality import evaluate_face_quality
-                                    face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                                    face_ok, _, _, _, _, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
                                     if face_ok:
                                         track.identity_state = 'FACE_QUALITY_PASSED'
                     
                     track.person_id = pid
                     
                     final_mapped_ids[c] = track.person_id if track.person_id is not None else -int(track.track_id)
-                    final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
+                    final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'TRACK_LOCKED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
                     final_mapped_confs[c] = float(conf)
                     
         # 4 & 5. Process unmatched detections (re-identify or create new tracks)
@@ -1314,12 +1314,12 @@ class BoTSORTTracker:
                         face_crop = person_crop[fy1:fy2, fx1:fx2]
                         if face_crop.size > 0:
                             from embedding_quality import evaluate_face_quality
-                            face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                            face_ok, _, _, _, _, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
                             if face_ok:
                                 new_track.identity_state = 'FACE_QUALITY_PASSED'
                 
             new_track.person_id = pid
-            if state in ['CONFIRMED', 'REIDENTIFIED']:
+            if state in ['CONFIRMED', 'TRACK_LOCKED', 'REIDENTIFIED']:
                 new_track.state = 'Confirmed'
                 new_track.hits = 5
                 
@@ -1863,26 +1863,20 @@ def start_area_count_demo():
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
                     if t > 0:
-                        # Confirmed person — check if face was detected
-                        track_obj = None
-                        for tk in tracker.tracks:
-                            if tk.person_id == t:
-                                track_obj = tk
-                                break
-                        has_face = track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED', 'CONFIRMED_PERSON', 'REIDENTIFIED')
-                        face_label = "face" if has_face else "no face"
-                        labels.append(f"#Person {t} {face_label}: {s:0.2f}")
+                        # Confirmed person - get state from temporal validator
+                        state_name = "CONFIRMED"
+                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(t)
+                        if state_obj:
+                            state_name = state_obj.state
+                        labels.append(f"#Person {t} {state_name}: {s:0.2f}")
                     else:
-                        # Unconfirmed track — check identity_state for face feedback
-                        track_obj = None
-                        for tk in tracker.tracks:
-                            if tk.track_id == abs(t):
-                                track_obj = tk
-                                break
-                        if track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED'):
-                            labels.append(f"#Track {abs(t)} face: {s:0.2f}")
-                        else:
-                            labels.append(f"#Track {abs(t)} no face: {s:0.2f}")
+                        # Tentative track
+                        track_id = abs(int(t))
+                        state_name = "TENTATIVE"
+                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(track_id)
+                        if state_obj:
+                            state_name = state_obj.state
+                        labels.append(f"#Track {track_id} {state_name}: {s:0.2f}")
 
                 # Draw bounding boxes and labels using OpenCV
                 for idx, (box, s, c, t) in enumerate(detections):

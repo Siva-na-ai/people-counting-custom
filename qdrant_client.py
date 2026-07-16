@@ -23,7 +23,7 @@ class QdrantClient:
         collections_to_init = {
             "face_embeddings": {"vectors": {"size": 512, "distance": "Cosine"}},
             "body_embeddings": {"vectors": {"size": 512, "distance": "Cosine"}},
-            "person_metadata": {"vectors": {"size": 1, "distance": "Cosine"}}  # 1D dummy vector for pure metadata collection compatibility
+            "person_registry": {"vectors": {"size": 1, "distance": "Cosine"}}  # 1D dummy vector for pure registry compatibility
         }
         
         for name, config_data in collections_to_init.items():

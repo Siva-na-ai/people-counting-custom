@@ -418,6 +418,7 @@ class BoTSORTTracker:
         
         self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry)
         self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
+        self.recovery_cache = {}
         
         # Load Hailo Face and YOLOv8 engines
         self.face_det = HailoFaceDetector(hef_path=config.SCRFD_HEF_PATH, target=self.shared_target)
@@ -919,14 +920,14 @@ class BoTSORTTracker:
                                 face_crop = person_crop[fy1:fy2, fx1:fx2]
                                 if face_crop.size > 0:
                                     from embedding_quality import evaluate_face_quality
-                                    face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                                    face_ok, _, _, _, _, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
                                     if face_ok:
                                         track.identity_state = 'FACE_QUALITY_PASSED'
                     
                     track.person_id = pid
                     
                     final_mapped_ids[c] = track.person_id if track.person_id is not None else -int(track.track_id)
-                    final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
+                    final_mapped_states[c] = 'Confirmed' if state in ['CONFIRMED', 'TRACK_LOCKED', 'REIDENTIFIED'] or track.state == 'Confirmed' else 'Tentative'
                     final_mapped_confs[c] = float(conf)
                     
         # 4 & 5. Process unmatched detections (re-identify or create new tracks)
@@ -948,15 +949,50 @@ class BoTSORTTracker:
             
             is_occluded = (d_idx in occluded_det_indices)
             
-            def get_new_pid():
-                new_pid = self.next_person_id
-                self.next_person_id += 1
-                return new_pid
+            # Clean expired recovery cache entries (older than 120s)
+            import time
+            now_time = time.time()
+            self.recovery_cache = {
+                k_pid: k_entry for k_pid, k_entry in self.recovery_cache.items()
+                if now_time - k_entry["timestamp"] <= config.TRACK_MEMORY_TTL
+            }
+            
+            # Try to recover PID using spatial proximity cache
+            recovered_pid = None
+            best_dist = 1e5
+            for k_pid, k_entry in self.recovery_cache.items():
+                c_box = k_entry["last_box"]
+                cx_det = (det_box[0] + det_box[2]) / 2.0
+                cy_det = (det_box[1] + det_box[3]) / 2.0
+                cx_cache = (c_box[0] + c_box[2]) / 2.0
+                cy_cache = (c_box[1] + c_box[3]) / 2.0
+                
+                dist = np.sqrt((cx_det - cx_cache)**2 + (cy_det - cy_cache)**2)
+                if dist < 150.0 and dist < best_dist:
+                    best_dist = dist
+                    recovered_pid = k_pid
 
-            pid, state, conf = self.identity_mgr.process_observation(
-                frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, 
-                self.camera_id, get_new_pid, is_occluded, current_person_id=new_track.person_id
-            )
+            if recovered_pid is not None:
+                pid = recovered_pid
+                state = "REIDENTIFIED"
+                conf = 1.0
+                del self.recovery_cache[recovered_pid]
+                
+                # Pre-initialize state in temporal validator
+                t_state = self.identity_mgr.fusion.temporal_validator.get_state(new_track.track_id)
+                if t_state is None:
+                    from temporal_validator import TrackIdentityState
+                    t_state = TrackIdentityState(new_track.track_id)
+                    self.identity_mgr.fusion.temporal_validator.track_states[new_track.track_id] = t_state
+                t_state.confirmed_id = recovered_pid
+                t_state.state = "TRACK_LOCKED"
+                t_state.identity_confidence = 1.0
+                logger.info(f"[RecoveryCache] Recovered Person #{recovered_pid} for Track #{new_track.track_id} via spatial cache (dist={best_dist:.1f})")
+            else:
+                pid, state, conf = self.identity_mgr.process_observation(
+                    frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, 
+                    self.camera_id, get_new_pid, is_occluded, current_person_id=new_track.person_id
+                )
             
             if pid is not None:
                 new_track.identity_state = 'CONFIRMED_PERSON'
@@ -974,12 +1010,12 @@ class BoTSORTTracker:
                         face_crop = person_crop[fy1:fy2, fx1:fx2]
                         if face_crop.size > 0:
                             from embedding_quality import evaluate_face_quality
-                            face_ok, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
+                            face_ok, _, _, _, _, _, _ = evaluate_face_quality(face_crop, best_face["score"], best_face["landmarks"])
                             if face_ok:
                                 new_track.identity_state = 'FACE_QUALITY_PASSED'
                 
             new_track.person_id = pid
-            if state in ['CONFIRMED', 'REIDENTIFIED']:
+            if state in ['CONFIRMED', 'TRACK_LOCKED', 'REIDENTIFIED']:
                 new_track.state = 'Confirmed'
                 new_track.hits = 5
                 
@@ -987,7 +1023,7 @@ class BoTSORTTracker:
             matched_tracks.append(new_track)
             
             final_mapped_ids[d_idx] = pid if pid is not None else -int(new_track.track_id)
-            final_mapped_states[d_idx] = 'Confirmed' if state in ['CONFIRMED', 'REIDENTIFIED'] else 'Tentative'
+            final_mapped_states[d_idx] = 'Confirmed' if state in ['CONFIRMED', 'TRACK_LOCKED', 'REIDENTIFIED'] else 'Tentative'
             final_mapped_confs[d_idx] = float(conf)
             
         # Post-match offline duplicate resolving
@@ -1013,6 +1049,13 @@ class BoTSORTTracker:
                     self.registry.handle_track_lost(t.person_id)
                 except Exception:
                     pass
+                
+                # Cache locked PID in spatial recovery cache
+                self.recovery_cache[t.person_id] = {
+                    "person_id": t.person_id,
+                    "last_box": t.box.copy() if isinstance(t.box, np.ndarray) else t.box,
+                    "timestamp": time.time()
+                }
                     
         self.tracks = [
             t for t in self.tracks 
@@ -1186,26 +1229,20 @@ def main():
                 labels = []
                 for idx, (_, s, c, t) in enumerate(detections):
                     if t > 0:
-                        # Confirmed person — check if face was detected
-                        track_obj = None
-                        for tk in tracker.tracks:
-                            if tk.person_id == t:
-                                track_obj = tk
-                                break
-                        has_face = track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED', 'CONFIRMED_PERSON', 'REIDENTIFIED')
-                        face_label = "face" if has_face else "no face"
-                        labels.append(f"#Person {t} {face_label}: {s:0.2f}")
+                        # Confirmed person - get state from temporal validator
+                        state_name = "CONFIRMED"
+                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(t)
+                        if state_obj:
+                            state_name = state_obj.state
+                        labels.append(f"#Person {t} {state_name}: {s:0.2f}")
                     else:
-                        # Unconfirmed track — check identity_state for face feedback
-                        track_obj = None
-                        for tk in tracker.tracks:
-                            if tk.track_id == abs(t):
-                                track_obj = tk
-                                break
-                        if track_obj is not None and track_obj.identity_state in ('FACE_VISIBLE', 'FACE_QUALITY_PASSED'):
-                            labels.append(f"#Track {abs(t)} face: {s:0.2f}")
-                        else:
-                            labels.append(f"#Track {abs(t)} no face: {s:0.2f}")
+                        # Tentative track
+                        track_id = abs(int(t))
+                        state_name = "TENTATIVE"
+                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(track_id)
+                        if state_obj:
+                            state_name = state_obj.state
+                        labels.append(f"#Track {track_id} {state_name}: {s:0.2f}")
                     
                 # Draw bounding boxes and labels using OpenCV
                 for idx, (box, s, c, t) in enumerate(detections):

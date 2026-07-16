@@ -13,7 +13,7 @@ class IdentityManager:
     """
     Coordinator controlling the overall identity workflow.
     Manages cache lookup, routes crops through face and body pipelines,
-    resolves identity with the FusionEngine, and offloads heavy database IO to background workers.
+    resolves identity with the FusionEngine, and offloads database IO to background workers.
     """
     def __init__(
         self,
@@ -69,141 +69,192 @@ class IdentityManager:
         person_crop = frame_bgr[y1:y2, x1:x2]
         
         if person_crop.size == 0:
-            return None, "Tentative", 0.0
+            return None, "TENTATIVE", 0.0
+
+        # Retrieve or initialize the track's temporal state machine
+        t_state = self.fusion.temporal_validator.get_state(track_id)
+        if t_state is None:
+            from temporal_validator import TrackIdentityState
+            t_state = TrackIdentityState(track_id)
+            self.fusion.temporal_validator.track_states[track_id] = t_state
+
+        # Initialize cooldown if not present
+        if not hasattr(t_state, "search_cooldown"):
+            t_state.search_cooldown = 0
+
+        # 1. Enforce Track Identity Lock (skip all searches & models if PID is confirmed and locked)
+        if config.TRACK_LOCK_ENABLED and t_state.state in ("TRACK_LOCKED", "CONFIRMED") and t_state.confirmed_id is not None:
+            person_id = t_state.confirmed_id
+            p_state = t_state.state
+            confidence = t_state.identity_confidence
             
+            # Keep registry updated
+            self.registry.update_person(
+                person_id, camera_id, track_id, 
+                len(self.gallery_mgr.get_face_embeddings(person_id)),
+                len(self.gallery_mgr.get_body_embeddings(person_id)),
+                confidence, hits=5
+            )
+            self.registry.persons[person_id]["last_box"] = det_box.copy()
+            
+            # Simple metadata update
+            self.worker_pool.submit_task(self._async_update_metadata_db, person_id)
+            return person_id, p_state, confidence
+
+        # 2. Enforce Search Cooldown (if cooldown active, skip Qdrant/embedding logic and just track visually)
+        if t_state.search_cooldown > 0:
+            t_state.search_cooldown -= 1
+            return None, t_state.state, t_state.identity_confidence
+
         face_emb = None
         body_emb = None
         face_quality = 0.0
         body_quality = 0.0
         face_ok = False
         
-        # If this track is already verified as a positive Person ID:
-        # We reuse the local mapping directly (skipping Qdrant search to match)
-        # But we still run face detection to potentially update/enrich database templates
-        existing_pid = current_person_id if (current_person_id is not None and current_person_id > 0) else None
+        # Face quality metrics
+        blur_score = 0.0
+        yaw, pitch, roll = 0.0, 0.0, 0.0
+        face_size = 0
+        face_conf = 0.0
+        quality_reason = "No face detected"
         
-        # 1. Run SCRFD Face Detector inside person crop
+        # 3. Run SCRFD Face Detector inside person crop
         face_dets = self.scrfd.detect(person_crop, threshold=0.55)
         logger.debug(f"[Track {track_id}] SCRFD: {len(face_dets)} face(s) detected in person crop {person_crop.shape}")
 
         if len(face_dets) > 0:
-            # Process the highest score face
             best_face = max(face_dets, key=lambda f: f["score"])
             face_bbox = best_face["bbox"]
-            landmarks = best_face["landmarks"]  # in person_crop coordinates
-            logger.debug(f"[Track {track_id}] Best face score={best_face['score']:.3f} bbox={[int(x) for x in face_bbox]}")
+            landmarks = best_face["landmarks"]
+            face_conf = best_face["score"]
 
-            # Extract face crop from person crop
             fx1 = max(0, int(face_bbox[0]))
             fy1 = max(0, int(face_bbox[1]))
             fx2 = min(person_crop.shape[1], int(face_bbox[2]))
             fy2 = min(person_crop.shape[0], int(face_bbox[3]))
             face_crop = person_crop[fy1:fy2, fx1:fx2]
-            logger.debug(f"[Track {track_id}] Face crop size: {face_crop.shape}")
+            face_size = min(face_crop.shape[0], face_crop.shape[1])
 
-            # Transform landmarks from person_crop coords → face_crop coords.
-            import numpy as np
             landmarks_in_face = landmarks - np.array([fx1, fy1], dtype=np.float32)
+            
+            # Calculate coordinates in parent frame to verify if face is fully inside boundaries
+            parent_fx1 = x1 + fx1
+            parent_fy1 = y1 + fy1
+            parent_fx2 = x1 + fx2
+            parent_fy2 = y1 + fy2
+            face_box_parent = np.array([parent_fx1, parent_fy1, parent_fx2, parent_fy2])
 
-            face_ok, face_quality, _ = evaluate_face_quality(
-                face_crop, best_face["score"], landmarks_in_face
+            # Call strict quality gate
+            face_ok, face_quality, blur_score, yaw, pitch, roll, quality_reason = evaluate_face_quality(
+                face_crop, face_conf, landmarks_in_face,
+                parent_w=w, parent_h=h, face_box_coords=face_box_parent
             )
-            logger.debug(f"[Track {track_id}] evaluate_face_quality → ok={face_ok} quality={face_quality:.3f}")
 
             if face_ok:
-                # Align and extract ArcFace features (uses original person_crop landmarks)
                 aligned_face = align_face(person_crop, landmarks)
                 face_emb = self.arcface.extract_embedding(aligned_face)
-                if face_emb is not None:
-                    logger.debug(f"[Track {track_id}] ArcFace embedding extracted (dim={len(face_emb)})")
-                else:
-                    logger.warning(f"[Track {track_id}] ArcFace returned None embedding despite face_ok=True")
             else:
-                logger.debug(f"[Track {track_id}] Face quality check FAILED — embedding NOT extracted")
-        else:
-            logger.debug(f"[Track {track_id}] No face detected by SCRFD")
-                
-        # Evaluate body quality
-        body_ok, body_quality, _ = evaluate_body_quality(person_crop, det_score)
-        
-        # 2. RUN BODY PIPELINE
-        # Only run Body ReID if config.USE_BODY_REID is enabled, OR if we are restoring an existing Person ID
-        if (config.USE_BODY_REID or existing_pid is not None) and body_ok:
-            body_emb = self.repvgg.infer(person_crop)
-            
-        # 3. Resolve identity
-        logger.debug(f"[Track {track_id}] Resolving identity: face_emb={'SET' if face_emb is not None else 'NONE'} body_emb={'SET' if body_emb is not None else 'NONE'} existing_pid={existing_pid}")
+                logger.debug(f"[Track {track_id}] Face quality check FAILED: {quality_reason}")
 
-        if existing_pid is not None:
-            # Reusing the local mapping, skipping Qdrant search for matching
-            person_id = existing_pid
-            confidence = 1.0
-            p_state = "CONFIRMED"
-            logger.debug(f"[Track {track_id}] Reusing existing Person #{person_id}")
-        else:
-            # Run FusionEngine to resolve final Person ID (searches Qdrant)
-            person_id, confidence = self.fusion.resolve_identity(
-                track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h,
-                next_person_id_callback,
-                face_detected=(len(face_dets) > 0)
-            )
-            if person_id is not None:
-                logger.info(f"[Track {track_id}] → Assigned Person #{person_id} (conf={confidence:.2f})")
-            else:
-                logger.debug(f"[Track {track_id}] → No Person ID assigned (face_emb={'SET' if face_emb is not None else 'NONE'})")
+        # 4. Run Body Pipeline (Extract body embedding if quality is ok)
+        body_ok, body_quality, _ = evaluate_body_quality(person_crop, det_score)
+        if body_ok:
+            body_emb = self.repvgg.infer(person_crop)
+
+        # 5. Resolve Identity (using Qdrant matcher and state validator)
+        person_id, confidence, match_details = self.fusion.resolve_identity(
+            track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h,
+            next_person_id_callback,
+            face_quality_passed=face_ok
+        )
+
+        p_state = t_state.state
+
+        # 6. Apply Search Cooldown on mismatch or ambiguity
+        if person_id is None:
+            # Set search cooldown to wait 5 frames before querying again
+            t_state.search_cooldown = config.SEARCH_RETRY_INTERVAL
+
+        latency = (time.time() - start_time) * 1000.0
+
+        # 7. Logging ReID decisions
+        decision = match_details.get("decision", "Rejected")
+        reason = match_details.get("reason", quality_reason)
+        logger.info(
+            f"[ReID Decision] Track={track_id} | State={p_state} | "
+            f"Current PID={t_state.confirmed_id} | Candidate PID={match_details.get('top1_pid')} | "
+            f"FaceSim={match_details.get('top1_score'):.3f} | BodySim={match_details.get('body_sim'):.3f} | "
+            f"Fusion={match_details.get('fusion_score'):.3f} | Top1={match_details.get('top1_score'):.3f} | "
+            f"Top2={match_details.get('top2_score'):.3f} | Gap={match_details.get('gap'):.3f} | "
+            f"Size={face_size} | Blur={blur_score:.1f} | Yaw={yaw:.1f} | Pitch={pitch:.1f} | Roll={roll:.1f} | "
+            f"Decision={decision} | Reason={reason} | Latency={latency:.1f}ms"
+        )
 
         if person_id is None:
-            return None, "Tentative", 0.0
-            
-        # 4. Update Person Registry Metadata and state machine
-        hits = 5
+            return None, p_state, confidence
+
+        # 8. Update Person Registry Metadata
         self.registry.update_person(
             person_id, camera_id, track_id, 
             len(self.gallery_mgr.get_face_embeddings(person_id)),
             len(self.gallery_mgr.get_body_embeddings(person_id)),
-            confidence, hits
+            confidence, hits=5
         )
         self.registry.persons[person_id]["last_box"] = det_box.copy()
-        p_state = self.registry.persons[person_id]["identity_state"]
         
-        # 5. Asynchronously update vector galleries and Qdrant DB if not occluded
-        latency = (time.time() - start_time) * 1000.0
+        # 9. Asynchronously update vector galleries and Qdrant DB if stable/confirmed
+        # Enforce Template Protection: never save templates unless the track is confirmed or locked,
+        # and similarity matches our FACE_TEMPLATE_UPDATE rules, and the face quality is verified
+        is_stable_state = p_state in ("CONFIRMED", "TRACK_LOCKED", "REIDENTIFIED")
         
-        if not is_occluded:
-            if face_emb is not None and face_quality > 0.50:
+        if not is_occluded and is_stable_state:
+            # Only save a new face template if:
+            # - Face quality passed.
+            # - It's a new person OR similarity to existing template is high (>= FACE_TEMPLATE_UPDATE)
+            is_new_person = (match_details.get("top1_score", 0.0) == 0.0)
+            is_good_template = match_details.get("top1_score", 0.0) >= config.FACE_TEMPLATE_UPDATE
+            
+            if face_emb is not None and face_ok and (is_new_person or is_good_template):
+                brightness = float(np.mean(cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)))
                 self.worker_pool.submit_task(
-                    self._async_update_face_gallery, person_id, face_emb, face_quality, camera_id
+                    self._async_update_face_gallery, person_id, face_emb, face_quality, camera_id,
+                    yaw, pitch, roll, blur_score, brightness
                 )
                 
-            if body_emb is not None and body_quality > 0.40:
+            # Only save body templates for verified/stable tracks
+            if body_emb is not None and body_ok:
                 self.worker_pool.submit_task(
                     self._async_update_body_gallery, person_id, body_emb, body_quality, camera_id
                 )
-        else:
-            logger.info(f"[IdentityManager] Gallery update frozen for Person #{person_id} due to occlusion.")
-            
-        self.worker_pool.submit_task(
-            self._async_update_metadata_db, person_id
-        )
-        self.worker_pool.submit_task(
-            self.logger.log_event, "Person_Updated", person_id, camera_id, confidence, latency
-        )
+        
+        self.worker_pool.submit_task(self._async_update_metadata_db, person_id)
         
         return person_id, p_state, confidence
 
-    def _async_update_face_gallery(self, person_id: int, embedding: np.ndarray, quality: float, camera_id: int):
-        # Always attempt to add to gallery — deduplication (sim > 0.93) handles near-identical frames
+    def _async_update_face_gallery(
+        self, 
+        person_id: int, 
+        embedding: np.ndarray, 
+        quality: float, 
+        camera_id: int,
+        yaw: float = 0.0,
+        pitch: float = 0.0,
+        roll: float = 0.0,
+        blur: float = 0.0,
+        brightness: float = 128.0
+    ):
         gallery = self.gallery_mgr.get_or_create_gallery(person_id)
         before_count = len(gallery.faces)
 
-        # 1. Update local gallery manager
-        inserted = self.gallery_mgr.add_face(person_id, embedding, quality)
+        # 1. Update local gallery manager (runs diversity checks)
+        inserted = self.gallery_mgr.add_face(person_id, embedding, quality, yaw, pitch, roll, brightness)
         after_count = len(gallery.faces)
 
         if inserted and after_count > before_count:
-            logger.info(f"[IdentityManager] Person #{person_id} face gallery: {before_count} → {after_count} embeddings (quality={quality:.3f})")
+            logger.info(f"[IdentityManager] Person #{person_id} face gallery: {before_count} → {after_count} templates")
             if self.qdrant:
-                # 2. Write to Qdrant Face Collection
+                # 2. Write to Qdrant Face Collection with separate metadata and versioning
                 point_id = str(uuid.uuid4())
                 ok = self.qdrant.upsert_point(
                     "face_embeddings",
@@ -213,15 +264,19 @@ class IdentityManager:
                         "person_id": person_id,
                         "quality_score": quality,
                         "timestamp": time.time(),
-                        "camera_id": camera_id
+                        "camera_id": camera_id,
+                        "yaw": yaw,
+                        "pitch": pitch,
+                        "roll": roll,
+                        "blur": blur,
+                        "brightness": brightness,
+                        "embedding_version": "arcface_mobilefacenet_h8l_v1"
                     }
                 )
                 if ok:
-                    logger.info(f"[IdentityManager] Person #{person_id} face embedding saved to Qdrant ✓ (id={point_id[:8]}...)")
+                    logger.info(f"[IdentityManager] Person #{person_id} face template saved to Qdrant ✓ (id={point_id[:8]}...)")
                 else:
-                    logger.warning(f"[IdentityManager] Person #{person_id} Qdrant upsert FAILED")
-        else:
-            logger.debug(f"[IdentityManager] Person #{person_id} face embedding skipped (dedup sim>0.93), gallery stays at {after_count}")
+                    logger.warning(f"[IdentityManager] Person #{person_id} face Qdrant upsert FAILED")
 
     def _async_update_body_gallery(self, person_id: int, embedding: np.ndarray, quality: float, camera_id: int):
         inserted = self.gallery_mgr.add_body(person_id, embedding, quality)
@@ -235,16 +290,16 @@ class IdentityManager:
                     "person_id": person_id,
                     "quality_score": quality,
                     "timestamp": time.time(),
-                    "camera_id": camera_id
+                    "camera_id": camera_id,
+                    "embedding_version": "repvgg_a0_v1"
                 }
             )
 
     def _async_update_metadata_db(self, person_id: int):
         if self.qdrant and person_id in self.registry.persons:
             p = self.registry.persons[person_id]
-            # Write metadata point (using 1D dummy vector [0.0] for compatibility)
             self.qdrant.upsert_point(
-                "person_metadata",
+                "person_registry",
                 person_id,
                 [0.0],
                 p

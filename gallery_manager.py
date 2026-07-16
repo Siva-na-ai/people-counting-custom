@@ -28,10 +28,19 @@ class GalleryManager:
                 self.galleries[person_id] = PersonGallery(person_id)
             return self.galleries[person_id]
 
-    def add_face(self, person_id: int, embedding: np.ndarray, quality_score: float) -> bool:
+    def add_face(
+        self, 
+        person_id: int, 
+        embedding: np.ndarray, 
+        quality_score: float,
+        yaw: float = 0.0,
+        pitch: float = 0.0,
+        roll: float = 0.0,
+        brightness: float = 128.0
+    ) -> bool:
         """
         Adds a face embedding to the person's local gallery.
-        Clusters near-identical views (similarity > 0.93) by keeping the highest quality one.
+        Deduplicates templates: rejects identical poses/lighting (sim > 0.93, pose diff < 10 deg, bright diff < 15).
         """
         if embedding is None:
             return False
@@ -44,9 +53,15 @@ class GalleryManager:
             duplicate_idx = -1
             for idx, item in enumerate(gallery.faces):
                 sim = np.dot(embedding, item["embedding"])
-                if sim > 0.93:  # Near identical crop / same pose
-                    duplicate_idx = idx
-                    break
+                if sim > 0.93:
+                    # Enforce strict gallery diversity check (sim > 0.93, pose < 10, lighting < 15)
+                    dyaw = abs(yaw - item.get("yaw", 0.0))
+                    dpitch = abs(pitch - item.get("pitch", 0.0))
+                    droll = abs(roll - item.get("roll", 0.0))
+                    dbright = abs(brightness - item.get("brightness", 128.0))
+                    if dyaw < 10.0 and dpitch < 10.0 and droll < 10.0 and dbright < 15.0:
+                        duplicate_idx = idx
+                        break
                     
             if duplicate_idx >= 0:
                 # Update existing cluster template if the new one is of higher quality
@@ -54,7 +69,11 @@ class GalleryManager:
                     gallery.faces[duplicate_idx] = {
                         "embedding": embedding,
                         "quality": quality_score,
-                        "time": now
+                        "time": now,
+                        "yaw": yaw,
+                        "pitch": pitch,
+                        "roll": roll,
+                        "brightness": brightness
                     }
                 return True
                 
@@ -62,7 +81,11 @@ class GalleryManager:
             gallery.faces.append({
                 "embedding": embedding,
                 "quality": quality_score,
-                "time": now
+                "time": now,
+                "yaw": yaw,
+                "pitch": pitch,
+                "roll": roll,
+                "brightness": brightness
             })
             
             # 3. Prune if count exceeds limit (20)
