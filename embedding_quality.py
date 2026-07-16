@@ -86,94 +86,21 @@ def evaluate_face_quality(
     landmarks: Optional[np.ndarray] = None
 ) -> Tuple[bool, float, Dict[str, Any]]:
     """
-    Evaluates face crop quality according to strict production rules.
+    Minimal face quality check — quality gates removed.
+    Any face detected by SCRFD with score >= 0.55 and a non-empty crop is accepted.
+    ArcFace handles pose/blur variations internally.
     Returns: (is_valid, final_quality_score, details_dict)
     """
-    details = {
-        "blur_score": 0.0,
-        "brightness": 0.0,
-        "size": 0,
-        "yaw": 0.0,
-        "pitch": 0.0,
-        "roll": 0.0,
-        "score": score
-    }
-    
+    details = {"score": score}
+
     if crop is None or crop.size == 0:
         return False, 0.0, details
-        
-    h, w = crop.shape[:2]
-    details["size"] = min(h, w)
-    
-    # 1. Size constraint (Both dimensions must be >= config.FACE_MIN_SIZE)
-    if h < config.FACE_MIN_SIZE or w < config.FACE_MIN_SIZE:
-        return False, 0.0, details
-        
-    # 2. Score/occlusion gate: must match detection threshold (0.55)
+
     if score < 0.55:
         return False, 0.0, details
-        
-    # Convert to grayscale for blur and brightness
-    img_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    
-    # 3. Brightness assessment
-    brightness = get_brightness(img_gray)
-    details["brightness"] = brightness
-    if not (config.FACE_BRIGHTNESS_MIN <= brightness <= config.FACE_BRIGHTNESS_MAX):
-        return False, 0.0, details
-        
-    # 4. Blur assessment (Laplacian Variance >= 80)
-    blur = get_laplacian_variance(img_gray)
-    details["blur_score"] = blur
-    if blur < config.FACE_BLUR_THRESHOLD:
-        return False, 0.0, details
-        
-    # 5. Landmark sanity, boundary, and pose estimation
-    if landmarks is not None:
-        # Landmarks sanity validation:
-        # [left_eye, right_eye, nose, left_mouth, right_mouth]
-        if len(landmarks) < 5:
-            return False, 0.0, details
-            
-        le, re, nose, lm, rm = landmarks[0], landmarks[1], landmarks[2], landmarks[3], landmarks[4]
-        
-        # Instability checks:
-        # Eyes must be above nose
-        if le[1] >= nose[1] or re[1] >= nose[1]:
-            return False, 0.0, details
-        # Mouth must be below nose
-        if lm[1] <= nose[1] or rm[1] <= nose[1]:
-            return False, 0.0, details
-        # Horizontal spacing of eyes
-        if abs(re[0] - le[0]) < 0.15 * w:
-            return False, 0.0, details
-            
-        # Border crop / partial face check:
-        # Reject if any landmark is within 2 pixels of the crop boundaries
-        for pt in landmarks:
-            if pt[0] <= 2.0 or pt[0] >= w - 2.0 or pt[1] <= 2.0 or pt[1] >= h - 2.0:
-                return False, 0.0, details
-                
-        # 3D PnP Pose estimation
-        yaw, pitch, roll = estimate_pose_pnp(landmarks)
-        details["yaw"] = yaw
-        details["pitch"] = pitch
-        details["roll"] = roll
-        
-        # Strict angle thresholds: Yaw < 20, Pitch < 20, Roll < 15
-        if yaw >= config.FACE_ANGLE_YAW_MAX:
-            return False, 0.0, details
-        if pitch >= config.FACE_ANGLE_PITCH_MAX:
-            return False, 0.0, details
-        if roll >= config.FACE_ANGLE_ROLL_MAX:
-            return False, 0.0, details
-            
-    # Compute combined quality score
-    norm_blur = min(1.0, blur / 200.0)
-    pose_penalty = 1.0 - (details.get("yaw", 0.0) / config.FACE_ANGLE_YAW_MAX)
-    final_quality = 0.4 * score + 0.4 * norm_blur + 0.2 * max(0.0, pose_penalty)
-    
-    return True, float(final_quality), details
+
+    return True, float(score), details
+
 
 def evaluate_body_quality(crop: np.ndarray, score: float) -> Tuple[bool, float, Dict[str, Any]]:
     """
