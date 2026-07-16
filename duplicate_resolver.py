@@ -73,13 +73,13 @@ class DuplicateIdentityResolver:
             sims = [np.dot(b1, b2) for b1 in bodies1 for b2 in bodies2]
             body_sim = float(np.max(sims))
             
-        # Merge criteria: face match above the same threshold as the matcher (0.75),
-        # or high body match when no face templates exist
-        if face_sim >= 0.75:
+        # Merge criteria: face match must be high confidence (0.82+) to avoid false merges.
+        # After ArcFace normalization fix: same-person=0.7-0.9, different-person=0.2-0.4
+        if face_sim >= 0.82:
             return True
-        elif face_sim == 0.0 and body_sim > 0.86:
+        elif face_sim == 0.0 and body_sim > 0.88:
             return True
-            
+
         return False
 
     def merge_identities(self, src_id: int, dst_id: int):
