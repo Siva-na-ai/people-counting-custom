@@ -989,6 +989,11 @@ class BoTSORTTracker:
                 t_state.identity_confidence = 1.0
                 logger.info(f"[RecoveryCache] Recovered Person #{recovered_pid} for Track #{new_track.track_id} via spatial cache (dist={best_dist:.1f})")
             else:
+                def get_new_pid():
+                    new_pid = self.next_person_id
+                    self.next_person_id += 1
+                    return new_pid
+
                 pid, state, conf = self.identity_mgr.process_observation(
                     frame_image, new_track.track_id, new_track.box, new_track.score, new_track.time_since_update, 
                     self.camera_id, get_new_pid, is_occluded, current_person_id=new_track.person_id
