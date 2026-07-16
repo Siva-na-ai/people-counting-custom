@@ -31,6 +31,8 @@ from modlib.models.zoo import NanoDetPlus416x416
 from yolo_detector import HailoYOLOv8Detector
 from scipy.optimize import linear_sum_assignment
 
+logger = logging.getLogger("tracker")
+
 try:
     import hailo_platform as hpf
 except ImportError:
