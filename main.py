@@ -57,7 +57,7 @@ class PipelineRunner:
         self.cache = EmbeddingCache()
         
         # 3. Initialize Identity Decision Engines
-        self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry)
+        self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry, self.gallery_mgr)
         self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
         
         # 4. Load Hailo HEF Engines

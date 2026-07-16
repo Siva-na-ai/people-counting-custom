@@ -10,10 +10,11 @@ class IdentityMatcher:
     Performs similarity search in Qdrant, merges face and body match vectors,
     resolves priority (face > body), and runs spatiotemporal movement gates.
     """
-    def __init__(self, qdrant_client, movement_validator, registry):
+    def __init__(self, qdrant_client, movement_validator, registry, gallery_mgr):
         self.qdrant = qdrant_client
         self.movement_validator = movement_validator
         self.registry = registry
+        self.gallery_mgr = gallery_mgr
 
     def match_identity(
         self, 

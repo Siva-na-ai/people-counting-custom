@@ -416,7 +416,7 @@ class BoTSORTTracker:
         self.temporal_val = TemporalValidator()
         self.cache = EmbeddingCache()
         
-        self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry)
+        self.matcher = IdentityMatcher(self.qdrant, self.movement_val, self.registry, self.gallery_mgr)
         self.fusion = FusionEngine(self.matcher, self.temporal_val, self.registry)
         self.recovery_cache = {}
         
