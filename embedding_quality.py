@@ -22,11 +22,11 @@ def estimate_pose_pnp(landmarks: np.ndarray) -> Tuple[float, float, float]:
     """
     # Standard 3D facial landmarks (model coordinates)
     model_points = np.array([
-        [-30.0, 30.0, 0.0],    # Left eye
-        [30.0, 30.0, 0.0],     # Right eye
+        [-30.0, -30.0, 0.0],   # Left eye
+        [30.0, -30.0, 0.0],    # Right eye
         [0.0, 0.0, 20.0],      # Nose tip
-        [-22.0, -30.0, 0.0],   # Left mouth corner
-        [22.0, -30.0, 0.0]     # Right mouth corner
+        [-22.0, 30.0, 0.0],    # Left mouth corner
+        [22.0, 30.0, 0.0]      # Right mouth corner
     ], dtype=np.float32)
     
     # Camera matrix approximation
