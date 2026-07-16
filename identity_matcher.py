@@ -65,12 +65,12 @@ class IdentityMatcher:
             if score >= config.REID_THRESHOLD_FACE:
                 candidates[pid] = candidates.get(pid, 0.0) + 0.60 * score
                 
-        # Parse body scores
+        # Parse body scores (Only if face hits are also present to avoid false body-only matches)
         for hit in body_hits:
             pid = hit["payload"]["person_id"]
             score = hit["score"]
-            if score >= config.REID_THRESHOLD_BODY:
-                weight = 0.40 if len(face_hits) > 0 else 1.0
+            if score >= config.REID_THRESHOLD_BODY and len(face_hits) > 0:
+                weight = 0.40
                 candidates[pid] = candidates.get(pid, 0.0) + weight * score
 
         # 4. Filter candidates using MovementValidator spatiotemporal checks

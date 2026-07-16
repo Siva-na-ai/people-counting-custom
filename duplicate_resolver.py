@@ -77,8 +77,6 @@ class DuplicateIdentityResolver:
         # After ArcFace normalization fix: same-person=0.7-0.9, different-person=0.2-0.4
         if face_sim >= 0.82:
             return True
-        elif face_sim == 0.0 and body_sim > 0.88:
-            return True
 
         return False
 
