@@ -145,6 +145,9 @@ class IdentityManager:
             parent_fx2 = x1 + fx2
             parent_fy2 = y1 + fy2
             face_box_parent = np.array([parent_fx1, parent_fy1, parent_fx2, parent_fy2])
+            
+            # Store face coordinates relative to full frame
+            t_state.face_box = [int(parent_fx1), int(parent_fy1), int(parent_fx2), int(parent_fy2)]
 
             # Call strict quality gate
             face_ok, face_quality, blur_score, yaw, pitch, roll, quality_reason = evaluate_face_quality(
@@ -157,6 +160,8 @@ class IdentityManager:
                 face_emb = self.arcface.extract_embedding(aligned_face)
             else:
                 logger.debug(f"[Track {track_id}] Face quality check FAILED: {quality_reason}")
+        else:
+            t_state.face_box = None
 
         # 4. Run Body Pipeline (Extract body embedding if quality is ok)
         body_ok, body_quality, _ = evaluate_body_quality(person_crop, det_score)

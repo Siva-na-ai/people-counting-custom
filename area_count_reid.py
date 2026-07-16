@@ -1885,6 +1885,20 @@ def start_area_count_demo():
                     if idx < len(labels):
                         cv2.putText(frame.image, labels[idx], (x1, max(y1 - 10, 20)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                    # Draw a thin yellow box around the face if detected
+                    state_obj = None
+                    if t > 0:
+                        for s_val in tracker.identity_mgr.fusion.temporal_validator.track_states.values():
+                            if s_val.confirmed_id == t:
+                                state_obj = s_val
+                                break
+                    else:
+                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(abs(int(t)))
+
+                    if state_obj and state_obj.face_box is not None:
+                        fx1, fy1, fx2, fy2 = state_obj.face_box
+                        cv2.rectangle(frame.image, (fx1, fy1), (fx2, fy2), (0, 255, 255), 1) # Thin yellow box
                 
                 if using_zones:
                     h_img, w_img = frame.image.shape[:2]
