@@ -84,33 +84,44 @@ class IdentityManager:
         
         # 1. Run SCRFD Face Detector inside person crop
         face_dets = self.scrfd.detect(person_crop, threshold=0.55)
+        logger.debug(f"[Track {track_id}] SCRFD: {len(face_dets)} face(s) detected in person crop {person_crop.shape}")
+
         if len(face_dets) > 0:
             # Process the highest score face
             best_face = max(face_dets, key=lambda f: f["score"])
             face_bbox = best_face["bbox"]
             landmarks = best_face["landmarks"]  # in person_crop coordinates
-            
+            logger.debug(f"[Track {track_id}] Best face score={best_face['score']:.3f} bbox={[int(x) for x in face_bbox]}")
+
             # Extract face crop from person crop
             fx1 = max(0, int(face_bbox[0]))
             fy1 = max(0, int(face_bbox[1]))
             fx2 = min(person_crop.shape[1], int(face_bbox[2]))
             fy2 = min(person_crop.shape[0], int(face_bbox[3]))
             face_crop = person_crop[fy1:fy2, fx1:fx2]
-            
+            logger.debug(f"[Track {track_id}] Face crop size: {face_crop.shape}")
+
             # Transform landmarks from person_crop coords → face_crop coords.
-            # Without this, boundary checks in evaluate_face_quality compare
-            # person_crop landmark values against face_crop width/height → always fail.
             import numpy as np
             landmarks_in_face = landmarks - np.array([fx1, fy1], dtype=np.float32)
-            
+
             face_ok, face_quality, _ = evaluate_face_quality(
                 face_crop, best_face["score"], landmarks_in_face
             )
-            
+            logger.debug(f"[Track {track_id}] evaluate_face_quality → ok={face_ok} quality={face_quality:.3f}")
+
             if face_ok:
                 # Align and extract ArcFace features (uses original person_crop landmarks)
                 aligned_face = align_face(person_crop, landmarks)
                 face_emb = self.arcface.extract_embedding(aligned_face)
+                if face_emb is not None:
+                    logger.debug(f"[Track {track_id}] ArcFace embedding extracted (dim={len(face_emb)})")
+                else:
+                    logger.warning(f"[Track {track_id}] ArcFace returned None embedding despite face_ok=True")
+            else:
+                logger.debug(f"[Track {track_id}] Face quality check FAILED — embedding NOT extracted")
+        else:
+            logger.debug(f"[Track {track_id}] No face detected by SCRFD")
                 
         # Evaluate body quality
         body_ok, body_quality, _ = evaluate_body_quality(person_crop, det_score)
@@ -121,20 +132,26 @@ class IdentityManager:
             body_emb = self.repvgg.infer(person_crop)
             
         # 3. Resolve identity
+        logger.debug(f"[Track {track_id}] Resolving identity: face_emb={'SET' if face_emb is not None else 'NONE'} body_emb={'SET' if body_emb is not None else 'NONE'} existing_pid={existing_pid}")
+
         if existing_pid is not None:
             # Reusing the local mapping, skipping Qdrant search for matching
             person_id = existing_pid
             confidence = 1.0
             p_state = "CONFIRMED"
+            logger.debug(f"[Track {track_id}] Reusing existing Person #{person_id}")
         else:
             # Run FusionEngine to resolve final Person ID (searches Qdrant)
-            # face_detected=True even if face_emb is None (quality check may have failed)
             person_id, confidence = self.fusion.resolve_identity(
                 track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h,
                 next_person_id_callback,
                 face_detected=(len(face_dets) > 0)
             )
-            
+            if person_id is not None:
+                logger.info(f"[Track {track_id}] → Assigned Person #{person_id} (conf={confidence:.2f})")
+            else:
+                logger.debug(f"[Track {track_id}] → No Person ID assigned (face_emb={'SET' if face_emb is not None else 'NONE'})")
+
         if person_id is None:
             return None, "Tentative", 0.0
             
