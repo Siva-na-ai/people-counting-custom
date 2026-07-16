@@ -41,8 +41,8 @@ BODY_MATCH_THRESHOLD = 0.50
 BODY_REJECT_THRESHOLD = 0.40
 
 # Temporal matching rules
+GOOD_FACE_CONFIRMATIONS = 2
 MIN_CONSECUTIVE_MATCHES = 4
-MIN_NEW_PERSON_OBSERVATIONS = 5
 SEARCH_RETRY_INTERVAL = 5
 
 # Gallery limits (maximum templates stored per person)

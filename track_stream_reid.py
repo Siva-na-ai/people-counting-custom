@@ -1232,31 +1232,30 @@ def main():
 
                 # Map the track ID in visual annotations
                 labels = []
+                colors = []
                 for idx, (_, s, c, t) in enumerate(detections):
                     if t > 0:
-                        # Confirmed person - get state from temporal validator
-                        state_name = "CONFIRMED"
-                        state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(t)
-                        if state_obj:
-                            state_name = state_obj.state
-                        labels.append(f"#Person {t} {state_name}: {s:0.2f}")
+                        # Confirmed/Verified person
+                        labels.append(f"Person {t}")
+                        colors.append((0, 255, 0)) # Green
                     else:
-                        # Tentative track
+                        # Temporary track
                         track_id = abs(int(t))
-                        state_name = "TENTATIVE"
+                        state_name = "TEMPORARY_TRACK"
                         state_obj = tracker.identity_mgr.fusion.temporal_validator.get_state(track_id)
                         if state_obj:
                             state_name = state_obj.state
-                        labels.append(f"#Track {track_id} {state_name}: {s:0.2f}")
+                        labels.append(f"T{track_id} ({state_name})")
+                        colors.append((0, 0, 255)) # Red
                     
                 # Draw bounding boxes and labels using OpenCV
                 for idx, (box, s, c, t) in enumerate(detections):
                     x1, y1, x2, y2 = map(int, box)
-                    color = (0, 255, 255) if t > 0 else (255, 0, 255) # Cyan for person, Magenta for track
+                    color = colors[idx] if idx < len(colors) else (0, 0, 255)
                     cv2.rectangle(frame.image, (x1, y1), (x2, y2), color, 2)
                     if idx < len(labels):
                         cv2.putText(frame.image, labels[idx], (x1, max(y1 - 10, 20)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
                 #-----Stream to HTTP-----
                 if args.stream:

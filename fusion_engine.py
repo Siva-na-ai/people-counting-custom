@@ -30,47 +30,60 @@ class FusionEngine:
         Runs multi-modal fusion checks.
         Returns: (final_person_id, confidence_score, match_details)
         """
-        # 1. Search vector DB and fuse similarity metrics
-        candidate_pid, confidence, match_details = self.matcher.match_identity(
-            face_emb, body_emb, det_box, time_since_update, img_w, img_h
-        )
-
         state = self.temporal_validator.get_state(track_id)
         if state is None:
             from temporal_validator import TrackIdentityState
             state = TrackIdentityState(track_id)
             self.temporal_validator.track_states[track_id] = state
 
-        # Initialize unmatched count if not present
-        if not hasattr(state, "unmatched_face_observations"):
-            state.unmatched_face_observations = 0
+        # If already verified/confirmed, return immediately without searching
+        if state.state in ("CONFIRMED", "TRACK_LOCKED", "REIDENTIFIED") and state.confirmed_id is not None:
+            final_person_id, p_state, final_conf = self.temporal_validator.validate_identity(
+                track_id, None, 0.0, face_quality_passed
+            )
+            match_details = {
+                "top1_pid": state.confirmed_id,
+                "top1_score": 1.0,
+                "top2_pid": None,
+                "top2_score": 0.0,
+                "gap": 0.0,
+                "body_sim": 1.0,
+                "fusion_score": 1.0,
+                "decision": "Accepted",
+                "reason": "Track locked"
+            }
+            return final_person_id, final_conf, match_details
 
-        # 2. Handle unmatched observations (New Person Creation Delay)
-        if candidate_pid is None:
-            if face_emb is not None and face_quality_passed:
-                state.unmatched_face_observations += 1
-                match_details["reason"] = f"Unmatched high-quality face ({state.unmatched_face_observations}/{config.MIN_NEW_PERSON_OBSERVATIONS} frames)"
-                
-                # Check if we have collected enough stable, unmatched observations
-                if state.unmatched_face_observations >= config.MIN_NEW_PERSON_OBSERVATIONS:
-                    # Allocate a brand new PID
-                    candidate_pid = next_person_id_callback()
-                    confidence = 1.0
-                    state.unmatched_face_observations = 0
-                    match_details["decision"] = "Accepted"
-                    match_details["reason"] = "Created new persistent Person ID"
-                else:
-                    # Keep tentative
-                    confidence = 0.0
-            else:
-                # Poor quality / no face -> reset unmatched count
-                state.unmatched_face_observations = 0
-                confidence = 0.0
+        # Run search only after enough consecutive high-quality faces are observed
+        if state.good_face_confirmations >= config.GOOD_FACE_CONFIRMATIONS:
+            # 1. Search vector DB and fuse similarity metrics
+            candidate_pid, confidence, match_details = self.matcher.match_identity(
+                face_emb, body_emb, det_box, time_since_update, img_w, img_h
+            )
+            
+            # 2. If unmatched, immediately create new PID without delay
+            if candidate_pid is None:
+                candidate_pid = next_person_id_callback()
+                confidence = 1.0
+                match_details["decision"] = "Accepted"
+                match_details["reason"] = f"Created new Person ID (immediate creation after {config.GOOD_FACE_CONFIRMATIONS} good faces)"
         else:
-            # We matched someone -> reset unmatched counter
-            state.unmatched_face_observations = 0
+            # Not enough good faces yet -> stay TENTATIVE/TEMPORARY_TRACK
+            candidate_pid = None
+            confidence = 0.0
+            match_details = {
+                "top1_pid": None,
+                "top1_score": 0.0,
+                "top2_pid": None,
+                "top2_score": 0.0,
+                "gap": 0.0,
+                "body_sim": 0.0,
+                "fusion_score": 0.0,
+                "decision": "Rejected",
+                "reason": f"Waiting for good face ({state.good_face_confirmations}/{config.GOOD_FACE_CONFIRMATIONS} frames)"
+            }
 
-        # 3. Apply TemporalValidator to filter flickering identity transitions
+        # 3. Apply TemporalValidator to update state
         final_person_id, p_state, final_conf = self.temporal_validator.validate_identity(
             track_id, candidate_pid, confidence, face_quality_passed
         )

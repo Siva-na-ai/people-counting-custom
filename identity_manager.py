@@ -162,6 +162,14 @@ class IdentityManager:
         if body_ok:
             body_emb = self.repvgg.infer(person_crop)
 
+        # Update consecutive good face confirmations counter
+        if face_ok and face_emb is not None:
+            t_state.good_face_confirmations += 1
+            logger.debug(f"[Track {track_id}] Good face count: {t_state.good_face_confirmations}")
+        else:
+            if t_state.state not in ("CONFIRMED", "TRACK_LOCKED", "REIDENTIFIED"):
+                t_state.good_face_confirmations = 0
+
         # 5. Resolve Identity (using Qdrant matcher and state validator)
         person_id, confidence, match_details = self.fusion.resolve_identity(
             track_id, face_emb, body_emb, body_quality, det_box, time_since_update, w, h,
@@ -171,10 +179,10 @@ class IdentityManager:
 
         p_state = t_state.state
 
-        # 6. Apply Search Cooldown on mismatch or ambiguity
-        if person_id is None:
-            # Set search cooldown to wait 5 frames before querying again
+        # 6. Apply Search Cooldown on actual search failure / rejection
+        if person_id is None and t_state.good_face_confirmations >= config.GOOD_FACE_CONFIRMATIONS:
             t_state.search_cooldown = config.SEARCH_RETRY_INTERVAL
+            t_state.good_face_confirmations = 0
 
         latency = (time.time() - start_time) * 1000.0
 
