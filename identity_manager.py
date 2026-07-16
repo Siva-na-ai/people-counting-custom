@@ -193,23 +193,35 @@ class IdentityManager:
 
     def _async_update_face_gallery(self, person_id: int, embedding: np.ndarray, quality: float, camera_id: int):
         # Always attempt to add to gallery — deduplication (sim > 0.93) handles near-identical frames
-                
+        gallery = self.gallery_mgr.get_or_create_gallery(person_id)
+        before_count = len(gallery.faces)
+
         # 1. Update local gallery manager
         inserted = self.gallery_mgr.add_face(person_id, embedding, quality)
-        if inserted and self.qdrant:
-            # 2. Write to Qdrant Face Collection
-            point_id = str(uuid.uuid4())
-            self.qdrant.upsert_point(
-                "face_embeddings", 
-                point_id, 
-                embedding.tolist(), 
-                {
-                    "person_id": person_id,
-                    "quality_score": quality,
-                    "timestamp": time.time(),
-                    "camera_id": camera_id
-                }
-            )
+        after_count = len(gallery.faces)
+
+        if inserted and after_count > before_count:
+            logger.info(f"[IdentityManager] Person #{person_id} face gallery: {before_count} → {after_count} embeddings (quality={quality:.3f})")
+            if self.qdrant:
+                # 2. Write to Qdrant Face Collection
+                point_id = str(uuid.uuid4())
+                ok = self.qdrant.upsert_point(
+                    "face_embeddings",
+                    point_id,
+                    embedding.tolist(),
+                    {
+                        "person_id": person_id,
+                        "quality_score": quality,
+                        "timestamp": time.time(),
+                        "camera_id": camera_id
+                    }
+                )
+                if ok:
+                    logger.info(f"[IdentityManager] Person #{person_id} face embedding saved to Qdrant ✓ (id={point_id[:8]}...)")
+                else:
+                    logger.warning(f"[IdentityManager] Person #{person_id} Qdrant upsert FAILED")
+        else:
+            logger.debug(f"[IdentityManager] Person #{person_id} face embedding skipped (dedup sim>0.93), gallery stays at {after_count}")
 
     def _async_update_body_gallery(self, person_id: int, embedding: np.ndarray, quality: float, camera_id: int):
         inserted = self.gallery_mgr.add_body(person_id, embedding, quality)

@@ -35,7 +35,7 @@ EMBEDDING_TTL_HOURS = 24   # 24-hour retention window
 
 
 # Similarity Thresholds
-REID_THRESHOLD_FACE = 0.55  # Threshold for ArcFace cosine similarity match
+REID_THRESHOLD_FACE = 0.65  # Raised from 0.55 — logs show same-person=0.62-0.68, different-person=0.51-0.62
 REID_THRESHOLD_BODY = 0.55  # Threshold for RepVGG body similarity match
 
 # Motion constraints (scaled by object body diagonal size)
