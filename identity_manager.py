@@ -121,7 +121,7 @@ class IdentityManager:
         quality_reason = "No face detected"
         
         # 3. Run SCRFD Face Detector inside person crop
-        face_dets = self.scrfd.detect(person_crop, threshold=0.40)
+        face_dets = self.scrfd.detect(person_crop, threshold=0.75)
         logger.debug(f"[Track {track_id}] SCRFD: {len(face_dets)} face(s) detected in person crop {person_crop.shape}")
 
         if len(face_dets) > 0:
