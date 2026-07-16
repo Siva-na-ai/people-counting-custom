@@ -71,15 +71,17 @@ class HailoFaceRecognizer:
             
         self._activate_network()
         try:
-            # Convert BGR to RGB
+            # Convert BGR to RGB and normalize to [-1, 1] (ArcFace standard preprocessing)
+            # Without normalization, raw [0-255] values cause saturated activations
+            # → same person gets cosine similarity ~0.11 instead of expected 0.7+
             crop_rgb = cv2.cvtColor(aligned_face_crop_bgr, cv2.COLOR_BGR2RGB)
-            # Ensure resizing to expected model input dimensions (usually 112x112)
             crop_resized = cv2.resize(crop_rgb, (self.width, self.height))
-            
+            crop_normalized = (crop_resized.astype(np.float32) - 127.5) / 128.0
+
             input_data = {
-                self.input_name: np.expand_dims(crop_resized, axis=0).astype(np.float32)
+                self.input_name: np.expand_dims(crop_normalized, axis=0).astype(np.float32)
             }
-            
+
             # Execute inference
             results = self.infer_pipeline.infer(input_data)
             embedding = results[self.output_name][0].flatten()

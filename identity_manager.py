@@ -192,15 +192,7 @@ class IdentityManager:
         return person_id, p_state, confidence
 
     def _async_update_face_gallery(self, person_id: int, embedding: np.ndarray, quality: float, camera_id: int):
-        # Retrieve existing face templates for this person
-        gallery = self.gallery_mgr.get_or_create_gallery(person_id)
-        
-        # If we already have 3 or more face templates, check if the new face quality is better than average
-        if len(gallery.faces) >= 3:
-            avg_quality = np.mean([f["quality"] for f in gallery.faces])
-            if quality <= avg_quality:
-                logger.info(f"[IdentityManager] Ignoring lower-quality face template ({quality:.2f} <= average {avg_quality:.2f}) for Person #{person_id}.")
-                return
+        # Always attempt to add to gallery — deduplication (sim > 0.93) handles near-identical frames
                 
         # 1. Update local gallery manager
         inserted = self.gallery_mgr.add_face(person_id, embedding, quality)
