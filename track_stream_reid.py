@@ -912,7 +912,7 @@ class BoTSORTTracker:
                         # Check if face is visible or passed quality gates to show progress
                         person_crop = self.get_crop(frame_image, track.box)
                         if person_crop is not None and person_crop.size > 0:
-                            face_dets = self.face_det.detect(person_crop, threshold=0.55)
+                            face_dets = self.face_det.detect(person_crop, threshold=0.40)
                             if len(face_dets) > 0:
                                 track.identity_state = 'FACE_VISIBLE'
                                 best_face = max(face_dets, key=lambda f: f["score"])
@@ -1006,7 +1006,7 @@ class BoTSORTTracker:
             else:
                 person_crop = self.get_crop(frame_image, new_track.box)
                 if person_crop is not None and person_crop.size > 0:
-                    face_dets = self.face_det.detect(person_crop, threshold=0.55)
+                    face_dets = self.face_det.detect(person_crop, threshold=0.40)
                     if len(face_dets) > 0:
                         new_track.identity_state = 'FACE_VISIBLE'
                         best_face = max(face_dets, key=lambda f: f["score"])
