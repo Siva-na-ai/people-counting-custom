@@ -88,21 +88,27 @@ class IdentityManager:
             # Process the highest score face
             best_face = max(face_dets, key=lambda f: f["score"])
             face_bbox = best_face["bbox"]
-            landmarks = best_face["landmarks"]
+            landmarks = best_face["landmarks"]  # in person_crop coordinates
             
-            # Check face crop visual quality using production settings
+            # Extract face crop from person crop
             fx1 = max(0, int(face_bbox[0]))
             fy1 = max(0, int(face_bbox[1]))
             fx2 = min(person_crop.shape[1], int(face_bbox[2]))
             fy2 = min(person_crop.shape[0], int(face_bbox[3]))
             face_crop = person_crop[fy1:fy2, fx1:fx2]
             
+            # Transform landmarks from person_crop coords → face_crop coords.
+            # Without this, boundary checks in evaluate_face_quality compare
+            # person_crop landmark values against face_crop width/height → always fail.
+            import numpy as np
+            landmarks_in_face = landmarks - np.array([fx1, fy1], dtype=np.float32)
+            
             face_ok, face_quality, _ = evaluate_face_quality(
-                face_crop, best_face["score"], landmarks
+                face_crop, best_face["score"], landmarks_in_face
             )
             
             if face_ok:
-                # Align and extract ArcFace features
+                # Align and extract ArcFace features (uses original person_crop landmarks)
                 aligned_face = align_face(person_crop, landmarks)
                 face_emb = self.arcface.extract_embedding(aligned_face)
                 
