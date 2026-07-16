@@ -46,6 +46,43 @@ class QdrantClient:
             except Exception as e:
                 logger.warning(f"Could not connect to Qdrant at {self.url} during initialization: {e}")
 
+    def get_max_person_id(self) -> int:
+        """
+        Scans face_embeddings to find the highest person_id stored.
+        Called on startup so next_person_id continues from where it left off.
+        Returns 0 if no embeddings exist yet.
+        """
+        max_pid = 0
+        offset = None
+        while True:
+            scroll_body = {"limit": 256, "with_payload": True, "with_vector": False}
+            if offset is not None:
+                scroll_body["offset"] = offset
+            try:
+                res = requests.post(
+                    f"{self.url}/collections/face_embeddings/points/scroll",
+                    json=scroll_body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10.0
+                )
+                if res.status_code != 200:
+                    break
+                data = res.json().get("result", {})
+                for pt in data.get("points", []):
+                    pid = pt.get("payload", {}).get("person_id", 0)
+                    if isinstance(pid, int) and pid > max_pid:
+                        max_pid = pid
+                next_offset = data.get("next_page_offset", None)
+                if next_offset is None:
+                    break
+                offset = next_offset
+            except Exception as e:
+                logger.warning(f"get_max_person_id failed: {e}")
+                break
+        logger.info(f"[QdrantClient] Max person_id in DB: {max_pid}")
+        return max_pid
+
+
     def upsert_point(self, collection: str, point_id: Any, vector: List[float], payload: Dict[str, Any]) -> bool:
         """
         Upserts a single point to the specified Qdrant collection.
@@ -128,6 +165,69 @@ class QdrantClient:
             except Exception as e:
                 logger.error(f"Qdrant retrieve failed: {e}")
                 return []
+
+    def cleanup_old_embeddings(self, ttl_hours: float = None) -> int:
+        """
+        Deletes all face and body embedding points older than ttl_hours.
+        Scrolls through each collection and batch-deletes expired points.
+        Returns total number of points deleted.
+        """
+        import time as _time
+        if ttl_hours is None:
+            ttl_hours = config.EMBEDDING_TTL_HOURS
+
+        cutoff_ts = _time.time() - (ttl_hours * 3600.0)
+        total_deleted = 0
+
+        for collection in ("face_embeddings", "body_embeddings"):
+            offset = None
+            expired_ids = []
+
+            # Scroll through all points in the collection
+            while True:
+                scroll_body = {
+                    "limit": 256,
+                    "with_payload": True,
+                    "with_vector": False
+                }
+                if offset is not None:
+                    scroll_body["offset"] = offset
+
+                try:
+                    res = requests.post(
+                        f"{self.url}/collections/{collection}/points/scroll",
+                        json=scroll_body,
+                        headers={"Content-Type": "application/json"},
+                        timeout=10.0
+                    )
+                except Exception as e:
+                    logger.error(f"Qdrant scroll failed on {collection}: {e}")
+                    break
+
+                if res.status_code != 200:
+                    break
+
+                data = res.json().get("result", {})
+                points = data.get("points", [])
+
+                for pt in points:
+                    ts = pt.get("payload", {}).get("timestamp", None)
+                    if ts is not None and float(ts) < cutoff_ts:
+                        expired_ids.append(pt["id"])
+
+                next_offset = data.get("next_page_offset", None)
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+            # Delete expired points
+            if expired_ids:
+                deleted = self.delete_points(collection, expired_ids)
+                if deleted:
+                    logger.info(f"[QdrantClient] Purged {len(expired_ids)} expired points from '{collection}' (TTL={ttl_hours}h)")
+                    total_deleted += len(expired_ids)
+
+        return total_deleted
 
     def delete_points(self, collection: str, ids: List[Any]) -> bool:
         """

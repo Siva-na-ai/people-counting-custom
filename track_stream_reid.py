@@ -397,9 +397,8 @@ class BoTSORTTracker:
         self.reid = HailoReID(hef_path=reid_model_path, target=self.shared_target)
         self.tracks = []
         self.next_track_id = 1
-        self.next_person_id = 1
         self.global_gallery = {}
-        
+
         # Initialize Qdrant and production components
         self.qdrant = QdrantClient()
         self.worker_pool = WorkerPool()
@@ -407,7 +406,12 @@ class BoTSORTTracker:
         self.registry = PersonRegistry(qdrant_client=self.qdrant)
         self.registry.lock = threading.Lock()
         self.event_logger = EventLogger()
-        
+
+        # Resume person ID counter from last saved Qdrant value to avoid ID collisions on restart
+        stored_max = self.qdrant.get_max_person_id()
+        self.next_person_id = stored_max + 1
+        logging.getLogger("tracker").info(f"Resuming next_person_id from {self.next_person_id} (Qdrant max was {stored_max})")
+
         self.movement_val = MovementValidator()
         self.temporal_val = TemporalValidator()
         self.cache = EmbeddingCache()

@@ -30,6 +30,10 @@ BODY_MIN_SIZE = 64          # Minimum body size
 FACE_GALLERY_MAX = 20
 BODY_GALLERY_MAX = 30
 
+# Embedding TTL — points older than this are purged from Qdrant automatically
+EMBEDDING_TTL_HOURS = 24   # 24-hour retention window
+
+
 # Similarity Thresholds
 REID_THRESHOLD_FACE = 0.55  # Threshold for ArcFace cosine similarity match
 REID_THRESHOLD_BODY = 0.55  # Threshold for RepVGG body similarity match
