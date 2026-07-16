@@ -73,8 +73,9 @@ class DuplicateIdentityResolver:
             sims = [np.dot(b1, b2) for b1 in bodies1 for b2 in bodies2]
             body_sim = float(np.max(sims))
             
-        # Merge criteria: high face match or high body match when face is absent
-        if face_sim > 0.88:
+        # Merge criteria: face match above the same threshold as the matcher (0.75),
+        # or high body match when no face templates exist
+        if face_sim >= 0.75:
             return True
         elif face_sim == 0.0 and body_sim > 0.86:
             return True

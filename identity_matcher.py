@@ -50,7 +50,7 @@ class IdentityMatcher:
                 best_face_score = score
                 best_face_pid = pid
                 
-        if best_face_pid is not None and best_face_score >= 0.90:
+        if best_face_pid is not None and best_face_score >= 0.75:
             # Check spatiotemporal validity
             if self._validate_motion_for_pid(best_face_pid, det_box, time_since_update, img_w, img_h):
                 return best_face_pid, best_face_score

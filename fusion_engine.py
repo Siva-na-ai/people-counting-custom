@@ -39,20 +39,19 @@ class FusionEngine:
             face_emb, body_emb, det_box, time_since_update, img_w, img_h
         )
         
-        # 2. If no candidate matched, allocate a new Person ID if:
-        #    - a good face embedding was extracted (face_emb), OR
-        #    - a face was at least detected (face_detected) even if quality blocked embedding
+        # 2. If no candidate matched, allocate a new Person ID ONLY if a quality
+        #    face embedding was extracted. A detected face without a good embedding
+        #    (face_detected=True but face_emb=None) must NOT get a new ID because
+        #    nothing would be stored in Qdrant → the person can never be re-matched
+        #    on re-entry → duplicate IDs every visit.
         if candidate_pid is None:
             if face_emb is not None:
-                # Full quality face — assign with full confidence
+                # Full quality face embedding — assign with full confidence
                 candidate_pid = next_person_id_callback()
                 confidence = 1.0
-            elif face_detected:
-                # Face visible but quality check blocked embedding extraction.
-                # Still assign a new ID so the person is tracked (low confidence).
-                candidate_pid = next_person_id_callback()
-                confidence = 0.5
             else:
+                # Face may be visible but quality check blocked embedding extraction.
+                # Do NOT assign a new ID — wait until a good embedding frame arrives.
                 return None, 0.0
             
         # 3. Apply TemporalValidator to filter flickering identity transitions
